@@ -1,0 +1,74 @@
+# Disc Tools - source-only repository
+#
+# Everything is ignored by default. Only files required to build Disc Tools
+# from source are explicitly allowed below.
+
+# Ignore everything
+*
+
+# Repository metadata / documentation
+!.gitignore
+!LICENSE
+!README.md
+
+# Go project files
+!go.mod
+!go.sum
+!*.go
+
+# Native source files, if added later
+!*.c
+!*.cc
+!*.cpp
+!*.h
+!*.hpp
+
+# Build/fetch scripts kept in the repository root
+!*.sh
+
+# MiSTer launcher only. Runtime/build output below Scripts/.config is ignored.
+!Scripts/
+Scripts/*
+!Scripts/disctools.sh
+
+# Optional source directories if the project grows
+!cmd/
+!cmd/**
+!internal/
+!internal/**
+!pkg/
+!pkg/**
+!src/
+!src/**
+
+# Explicitly keep generated/downloaded content out of Git even if patterns
+# above are expanded later.
+third_party/
+Scripts/.config/
+build/
+dist/
+release/
+out/
+*.zip
+*.tar
+*.tar.gz
+*.tar.bz2
+*.tgz
+*.log
+*.tmp
+*.temp
+*.o
+*.a
+*.so
+*.dll
+*.exe
+*.bin
+
+# Editor / OS clutter
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*~
+*.swp
+*.swo
