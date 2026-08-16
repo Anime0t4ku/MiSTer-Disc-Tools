@@ -1,0 +1,143 @@
+name: Disc Tools
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build Disc Tools
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential curl xz-utils bzip2 zip file
+
+      - name: Install ARM GCC 10.2 Toolchain
+        run: |
+          curl -fL --retry 3 \
+            "https://developer.arm.com/-/media/Files/downloads/gnu-a/10.2-2020.11/binrel/gcc-arm-10.2-2020.11-x86_64-arm-none-linux-gnueabihf.tar.xz" \
+            -o /tmp/gcc-arm.tar.xz
+
+          sudo tar -xJf /tmp/gcc-arm.tar.xz -C /opt
+          echo "/opt/gcc-arm-10.2-2020.11-x86_64-arm-none-linux-gnueabihf/bin" >> "$GITHUB_PATH"
+
+      - name: Verify ARM Toolchain
+        run: |
+          arm-none-linux-gnueabihf-gcc --version
+          arm-none-linux-gnueabihf-g++ --version
+
+      - name: Build Disc Tools
+        env:
+          CC: arm-none-linux-gnueabihf-gcc
+          CXX: arm-none-linux-gnueabihf-g++
+        run: |
+          chmod +x build-mister.sh build_cdrdao.sh build_xorriso.sh fetch_chdman.sh Scripts/disctools.sh
+          ./build-mister.sh
+
+      - name: Verify Build Output
+        run: |
+          test -f Scripts/disctools.sh
+          test -f Scripts/.config/disctools/disctools
+          test -f Scripts/.config/disctools/bin/cdrdao
+          test -f Scripts/.config/disctools/bin/toc2cue
+          test -f Scripts/.config/disctools/bin/cue2toc
+          test -f Scripts/.config/disctools/bin/chdman
+          test -f Scripts/.config/disctools/bin/xorriso
+
+          file Scripts/.config/disctools/disctools
+          file Scripts/.config/disctools/bin/cdrdao
+          file Scripts/.config/disctools/bin/chdman
+          file Scripts/.config/disctools/bin/xorriso
+
+          arm-none-linux-gnueabihf-readelf -h Scripts/.config/disctools/disctools | grep -q 'Machine:.*ARM'
+
+      - name: Package Disc Tools
+        run: |
+          rm -f DiscTools.zip
+
+          # Ship only files required at runtime. Do not include licenses,
+          # temp, logs, build sources, or other repository files.
+          zip -r DiscTools.zip \
+            Scripts/disctools.sh \
+            Scripts/.config/disctools/disctools \
+            Scripts/.config/disctools/bin
+
+      - name: Verify Release Package
+        run: |
+          unzip -l DiscTools.zip
+          unzip -l DiscTools.zip | grep -q 'Scripts/disctools.sh'
+          unzip -l DiscTools.zip | grep -q 'Scripts/.config/disctools/disctools'
+          unzip -l DiscTools.zip | grep -q 'Scripts/.config/disctools/bin/cdrdao'
+          unzip -l DiscTools.zip | grep -q 'Scripts/.config/disctools/bin/chdman'
+          unzip -l DiscTools.zip | grep -q 'Scripts/.config/disctools/bin/xorriso'
+
+          if unzip -l DiscTools.zip | grep -Eq 'Scripts/.config/disctools/(licenses|temp|logs)/'; then
+            echo 'Release package contains an excluded runtime/build folder.' >&2
+            exit 1
+          fi
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DiscTools
+          path: DiscTools.zip
+          if-no-files-found: error
+
+  release:
+    name: Create / Update Pre-release
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: DiscTools
+          path: release-assets
+
+      - name: Verify Release Package
+        run: |
+          ls -lh release-assets
+          test -f release-assets/DiscTools.zip
+
+      - name: Update Git Tag
+        run: |
+          git tag -f Pre-release "$GITHUB_SHA"
+          git push -f origin Pre-release
+
+      - name: Create or Update Release
+        uses: ncipollo/release-action@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          tag: Pre-release
+          name: Pre-release
+          prerelease: true
+          allowUpdates: true
+          removeArtifacts: true
+          replacesArtifacts: true
+          artifacts: release-assets/DiscTools.zip
