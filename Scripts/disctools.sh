@@ -1,5 +1,5 @@
 #!/bin/bash
-VERSION="1.0.0"
+VERSION="1.1.0"
 BASE="/media/fat/Scripts/.config/disctools"
 BIN="$BASE/disctools"
 
@@ -8,7 +8,7 @@ if [ "$1" = "--version" ] || [ "$1" = "-v" ]; then
   exit 0
 fi
 
-mkdir -p "$BASE/bin" "$BASE/temp" "$BASE/logs"
+mkdir -p "$BASE/bin" "$BASE/temp" "$BASE/logs" "$BASE/fonts"
 chmod +x "$BIN" "$BASE"/bin/* 2>/dev/null || true
 
 if [ ! -x "$BIN" ]; then

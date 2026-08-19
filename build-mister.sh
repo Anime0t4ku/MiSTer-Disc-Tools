@@ -2,7 +2,7 @@
 set -eu
 cd "$(dirname "$0")"
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 TOOLCHAIN="/opt/gcc-arm-10.2-2020.11-x86_64-arm-none-linux-gnueabihf/bin"
 [ -d "$TOOLCHAIN" ] && PATH="$TOOLCHAIN:$PATH"
 export PATH
@@ -40,6 +40,7 @@ need file
 mkdir -p Scripts/.config/disctools/bin \
          Scripts/.config/disctools/temp \
          Scripts/.config/disctools/logs \
+         Scripts/.config/disctools/fonts \
          third_party/build-logs
 
 printf 'Building Disc Tools v%s\n' "$VERSION"
@@ -56,8 +57,10 @@ check_arm Scripts/.config/disctools/bin/cue2toc "cue2toc ARMv7"
 check_arm Scripts/.config/disctools/bin/xorriso "xorriso ARMv7"
 
 printf '[....] Disc Tools ARMv7\n'
-if ! GOOS=linux GOARCH=arm GOARM=7 CGO_ENABLED=0 \
-  go build -trimpath -ldflags="-s -w" -o Scripts/.config/disctools/disctools ./main.go \
+CC="${CC:-arm-none-linux-gnueabihf-gcc}"
+need "$CC"
+if ! GOOS=linux GOARCH=arm GOARM=7 CGO_ENABLED=1 CC="$CC" CGO_LDFLAGS="${CGO_LDFLAGS:-} -latomic" \
+  go build -trimpath -ldflags="-s -w" -o Scripts/.config/disctools/disctools . \
   >third_party/build-logs/disctools.log 2>&1; then
   echo "[FAIL] Disc Tools build failed" >&2
   tail -n 40 third_party/build-logs/disctools.log >&2 || true
