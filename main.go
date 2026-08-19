@@ -23,7 +23,7 @@ import (
 )
 
 const (
-	version        = "1.1.0"
+	version        = "1.2.0"
 	baseDir        = "/media/fat/Scripts/.config/disctools"
 	binDir         = baseDir + "/bin"
 	tempDir        = baseDir + "/temp"
@@ -1439,8 +1439,11 @@ func (a *App) ripDisc() {
 	toc := base + ".toc"
 	cue := base + ".cue"
 	chd := base + ".chd"
-	// 0x20000 asks the generic MMC driver to swap CDDA samples into CUE-compatible byte order.
-	cmd := exec.Command(helper("cdrdao"), "read-cd", "--device", device, "--driver", "generic-mmc:0x20000", "--read-raw", "--datafile", bin, toc)
+	// Keep cdrdao's native raw image untouched while the TOC is still in use.
+	// cdrdao stores raw CD-DA samples in big-endian order; standard CUE/BIN
+	// images use the opposite byte order. We create a separate CUE-compatible
+	// BIN below with toc2cue -C -s, swapping only the AUDIO tracks.
+	cmd := exec.Command(helper("cdrdao"), "read-cd", "--device", device, "--read-raw", "--datafile", bin, toc)
 	if err := a.runJob("RIPPING PHYSICAL DISC", cmd); err != nil {
 		a.message("RIP FAILED", []string{err.Error(), "Partial files were kept."})
 		return
@@ -1449,41 +1452,68 @@ func (a *App) ripDisc() {
 		a.message("RIP FAILED", []string{"Could not normalize TOC BIN path:", err.Error(), "BIN and TOC were kept."})
 		return
 	}
-	cmd = exec.Command(helper("toc2cue"), toc, cue)
+
+	convertedBin := base + "-cue.bin"
+	cmd = exec.Command(helper("toc2cue"), "-C", filepath.Base(convertedBin), "-s", filepath.Base(toc), filepath.Base(cue))
+	cmd.Dir = dest
 	if err := a.runJob("CREATING CUE", cmd); err != nil {
-		a.message("CUE FAILED", []string{err.Error(), "BIN and TOC were kept."})
+		a.message("CUE FAILED", []string{err.Error(), "Native BIN and TOC were kept."})
 		return
 	}
-	if err := normalizeDescriptorBinReference(cue, bin); err != nil {
-		a.message("CUE FAILED", []string{"Could not normalize CUE BIN path:", err.Error(), "BIN/CUE/TOC were kept."})
+	if _, err := os.Stat(convertedBin); err != nil {
+		a.message("CUE FAILED", []string{"toc2cue did not create the expected CUE-compatible BIN.", "Native BIN and TOC were kept."})
 		return
 	}
-	if i == 0 {
-		_ = os.Remove(toc)
-		a.message("RIP COMPLETE", []string{"Created:", cue, bin})
+	if err := normalizeDescriptorBinReference(cue, convertedBin); err != nil {
+		a.message("CUE FAILED", []string{"Could not normalize CUE BIN path:", err.Error(), "Native BIN/TOC and converted BIN were kept."})
 		return
 	}
-	if err := checkHelper("chdman"); err != nil {
-		a.message("DEPENDENCY", []string{err.Error(), "BIN/CUE/TOC were kept."})
-		return
+
+	if i != 0 {
+		if err := checkHelper("chdman"); err != nil {
+			a.message("DEPENDENCY", []string{err.Error(), "BIN/CUE/TOC were kept."})
+			return
+		}
+		// Build CHD from cdrdao's native TOC/BIN before replacing the BIN with
+		// the CUE-compatible byte-swapped copy. This preserves CD-DA byte order
+		// and the raw disc layout for CHD at the same time.
+		chdCmd := exec.Command(helper("chdman"), "createcd", "-i", filepath.Base(toc), "-o", chd)
+		chdCmd.Dir = dest
+		if err := a.runJob("CONVERTING TO CHD", chdCmd); err != nil {
+			a.message("CHD CONVERSION FAILED", []string{err.Error(), "BIN/CUE/TOC were kept."})
+			return
+		}
+		if err := a.runJob("VERIFYING CHD", exec.Command(helper("chdman"), "verify", "-i", chd)); err != nil {
+			a.message("CHD VERIFY FAILED", []string{err.Error(), "BIN/CUE/TOC were kept."})
+			return
+		}
 	}
-	// Convert from cdrdao's native TOC rather than the derived CUE. CHDMan
-	// supports CDRDAO TOC input directly, which preserves the raw disc layout
-	// and avoids making CHD creation depend on toc2cue compatibility.
-	if err := a.runJob("CONVERTING TO CHD", exec.Command(helper("chdman"), "createcd", "-i", toc, "-o", chd)); err != nil {
-		a.message("CHD CONVERSION FAILED", []string{err.Error(), "BIN/CUE/TOC were kept."})
-		return
-	}
-	if err := a.runJob("VERIFYING CHD", exec.Command(helper("chdman"), "verify", "-i", chd)); err != nil {
-		a.message("CHD VERIFY FAILED", []string{err.Error(), "BIN/CUE/TOC were kept."})
-		return
-	}
-	_ = os.Remove(toc)
+
 	if i == 2 {
+		_ = os.Remove(toc)
 		_ = os.Remove(cue)
 		_ = os.Remove(bin)
+		_ = os.Remove(convertedBin)
+		a.message("RIP COMPLETE", []string{"Created and verified:", chd})
+		return
 	}
-	a.message("RIP COMPLETE", []string{"Created and verified:", chd})
+
+	// Publish the standard CUE/BIN pair only after native TOC/CHD work is done.
+	_ = os.Remove(bin)
+	if err := os.Rename(convertedBin, bin); err != nil {
+		a.message("RIP FAILED", []string{"Could not finalize CUE-compatible BIN:", err.Error(), "CUE and converted BIN were kept."})
+		return
+	}
+	if b, err := os.ReadFile(cue); err == nil {
+		text := strings.ReplaceAll(string(b), filepath.Base(convertedBin), filepath.Base(bin))
+		_ = os.WriteFile(cue, []byte(text), 0644)
+	}
+	_ = os.Remove(toc)
+	if i == 0 {
+		a.message("RIP COMPLETE", []string{"Created:", cue, bin})
+	} else {
+		a.message("RIP COMPLETE", []string{"Created and verified:", chd, "Kept:", cue, bin})
+	}
 }
 
 func (a *App) burnDisc() {
@@ -1522,6 +1552,260 @@ func (a *App) chooseBurnSpeed() (string, bool) {
 		return "", true
 	}
 }
+func cueNeedsAudioSwap(cue string) bool {
+	b, err := os.ReadFile(cue)
+	if err != nil {
+		return false
+	}
+	fileRE := regexp.MustCompile(`(?i)^\s*FILE\s+(?:"[^"]+"|\S+)\s+(\S+)`)
+	audioRE := regexp.MustCompile(`(?i)^\s*TRACK\s+\d+\s+AUDIO(?:\s|$)`)
+	fileKind := ""
+	for _, line := range strings.Split(string(b), "\n") {
+		if m := fileRE.FindStringSubmatch(line); len(m) == 2 {
+			fileKind = strings.ToUpper(m[1])
+			continue
+		}
+		if audioRE.MatchString(line) && fileKind == "BINARY" {
+			return true
+		}
+	}
+	return false
+}
+
+func cueSingleBinaryFile(cue string) string {
+	b, err := os.ReadFile(cue)
+	if err != nil {
+		return ""
+	}
+	re := regexp.MustCompile(`(?im)^\s*FILE\s+(?:"([^"]+)"|(\S+))\s+(\S+)\s*$`)
+	matches := re.FindAllStringSubmatch(string(b), -1)
+	if len(matches) != 1 || strings.ToUpper(matches[0][3]) != "BINARY" {
+		return ""
+	}
+	name := matches[0][1]
+	if name == "" {
+		name = matches[0][2]
+	}
+	if !filepath.IsAbs(name) {
+		name = filepath.Join(filepath.Dir(cue), name)
+	}
+	if st, err := os.Stat(name); err != nil || st.IsDir() {
+		return ""
+	}
+	return name
+}
+
+func (a *App) copyFileWithProgress(src, dst, title string) error {
+	info, err := os.Stat(src)
+	if err != nil {
+		return err
+	}
+	total := info.Size()
+	updates := make(chan int64, 16)
+	done := make(chan error, 1)
+	cancel := make(chan struct{})
+	var cancelOnce sync.Once
+	stop := func() { cancelOnce.Do(func() { close(cancel) }) }
+
+	go func() {
+		var copied int64
+		lastSent := int64(-1)
+		err := copyFileCancelable(src, dst, cancel, func(n int64) {
+			copied += n
+			mb := copied / (1024 * 1024)
+			if mb != lastSent || copied >= total {
+				lastSent = mb
+				select {
+				case updates <- copied:
+				default:
+				}
+			}
+		})
+		done <- err
+	}()
+
+	current := int64(0)
+	started := time.Now()
+	tick := time.NewTicker(100 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		a.fb.fill(a.background())
+		a.title("DISC TOOLS V" + version)
+		opScale := max(2, a.fb.h/240)
+		pctScale := max(4, a.fb.h/145)
+		statusScale := max(1, a.fb.h/360)
+		centerY := a.fb.h / 2
+		opY := centerY - max(155, a.fb.h/5)
+		a.fb.text(centeredX(a.fb.w, opScale, title), opY, opScale, title, fg)
+
+		pct := 0.0
+		if total > 0 {
+			pct = float64(current) * 100 / float64(total)
+			if pct > 100 {
+				pct = 100
+			}
+		}
+		pctText := fmt.Sprintf("%.1f%%", pct)
+		a.fb.text(centeredX(a.fb.w, pctScale, pctText), opY+70, pctScale, pctText, fg)
+		barW := max(260, (a.fb.w*3)/4)
+		if barW > a.fb.w-80 {
+			barW = a.fb.w - 80
+		}
+		barH := max(24, a.fb.h/28)
+		barX := (a.fb.w - barW) / 2
+		barY := opY + 145
+		a.fb.border(barX, barY, barW, barH, max(2, barH/10), dim)
+		innerMax := max(0, barW-8)
+		inner := int(float64(innerMax) * pct / 100)
+		if inner > 0 {
+			a.fb.rect(barX+4, barY+4, inner, max(1, barH-8), fg)
+		}
+		amount := fmt.Sprintf("%.1f MB / %.1f MB", float64(current)/(1024*1024), float64(total)/(1024*1024))
+		a.fb.text(centeredX(a.fb.w, statusScale, amount), barY+barH+35, statusScale, amount, fg)
+		name := short(filepath.Base(src), max(24, (a.fb.w-100)/6))
+		a.fb.text(centeredX(a.fb.w, 1, name), barY+barH+69, 1, name, dim)
+		elapsed := "Elapsed " + time.Since(started).Round(time.Second).String()
+		a.fb.text(centeredX(a.fb.w, 1, elapsed), barY+barH+91, 1, elapsed, dim)
+		a.footer("B/ESC Cancel")
+		a.present()
+
+		select {
+		case current = <-updates:
+		case err := <-done:
+			if err == nil {
+				current = total
+			}
+			return err
+		case <-tick.C:
+		case x := <-a.acts:
+			if x == actBack {
+				stop()
+				err := <-done
+				if err == nil {
+					err = errors.New("cancelled")
+				}
+				return err
+			}
+		}
+	}
+}
+
+func (a *App) stageNativeCue(cue string) (string, func(), error) {
+	sourceBin := cueSingleBinaryFile(cue)
+	if sourceBin == "" {
+		return cue, func() {}, nil
+	}
+	dir, err := os.MkdirTemp(filepath.Dir(cue), ".disctools-cue-")
+	if err != nil {
+		if mkErr := os.MkdirAll(tempDir, 0755); mkErr != nil {
+			return "", func() {}, mkErr
+		}
+		dir, err = os.MkdirTemp(tempDir, "cue-burn-")
+		if err != nil {
+			return "", func() {}, err
+		}
+	}
+	cleanup := func() { _ = os.RemoveAll(dir) }
+	stagedCue := filepath.Join(dir, "image.cue")
+	stagedBin := filepath.Join(dir, "image.bin")
+
+	// cdrdao's native CUE parser resolves the BIN from the CUE basename
+	// (image.cue -> image.bin). Rewrite the one BINARY FILE statement to
+	// match the staged filename; otherwise cdrdao looks for the original
+	// BIN name in the temporary folder and unnecessarily falls back to cue2toc.
+	cueData, err := os.ReadFile(cue)
+	if err != nil {
+		cleanup()
+		return "", func() {}, err
+	}
+	fileLineRE := regexp.MustCompile(`(?im)^\s*FILE\s+(?:"[^"]+"|\S+)\s+BINARY\s*$`)
+	if len(fileLineRE.FindAllIndex(cueData, -1)) != 1 {
+		cleanup()
+		return cue, func() {}, nil
+	}
+	cueData = fileLineRE.ReplaceAll(cueData, []byte(`FILE "image.bin" BINARY`))
+	if err := os.WriteFile(stagedCue, cueData, 0644); err != nil {
+		cleanup()
+		return "", func() {}, err
+	}
+	if err := os.Link(sourceBin, stagedBin); err != nil {
+		// FAT/exFAT media used by MiSTer do not support hard links. Copying a
+		// full CD image can take a while, so keep the framebuffer responsive and
+		// show the same percentage/amount progress used by the other long jobs.
+		if err := a.copyFileWithProgress(sourceBin, stagedBin, "PREPARING CUE"); err != nil {
+			cleanup()
+			return "", func() {}, err
+		}
+	}
+	return stagedCue, cleanup, nil
+}
+
+func (a *App) cdrdaoAcceptsCue(cue string) bool {
+	cmd := exec.Command(helper("cdrdao"), "show-toc", cue)
+	cmd.Dir = filepath.Dir(cue)
+	// show-toc is normally quick, but on slow USB/SD media it can take long
+	// enough to look frozen. Run it through the standard job UI so the user
+	// always sees activity and can cancel.
+	return a.runJob("CHECKING CUE", cmd) == nil
+}
+
+func (a *App) burnCuePrepared(cue, speed string) {
+	needsAudioSwap := cueNeedsAudioSwap(cue)
+	nativeCue, cleanupNative, err := a.stageNativeCue(cue)
+	if err != nil {
+		a.message("BURN FAILED", []string{"Could not prepare CUE/BIN image:", err.Error()})
+		return
+	}
+	defer cleanupNative()
+
+	burnDescription := nativeCue
+	burnDir := filepath.Dir(nativeCue)
+	if !a.cdrdaoAcceptsCue(nativeCue) {
+		if err := checkHelper("cue2toc"); err != nil {
+			a.message("DEPENDENCY", []string{err.Error()})
+			return
+		}
+		if err := os.MkdirAll(tempDir, 0755); err != nil {
+			a.message("BURN FAILED", []string{err.Error()})
+			return
+		}
+		tocDir, err := os.MkdirTemp(tempDir, "cue2toc-")
+		if err != nil {
+			a.message("BURN FAILED", []string{err.Error()})
+			return
+		}
+		defer os.RemoveAll(tocDir)
+		toc := filepath.Join(tocDir, "image.toc")
+		cmd := exec.Command(helper("cue2toc"), "-o", toc, cue)
+		cmd.Dir = filepath.Dir(cue)
+		if err := a.runJob("PREPARING CUE", cmd); err != nil {
+			a.message("BURN FAILED", []string{err.Error()})
+			return
+		}
+		burnDescription = toc
+		burnDir = filepath.Dir(cue)
+	}
+
+	args := []string{"write", "--device", device, "--eject", "-n"}
+	if speed != "" {
+		args = append(args, "--speed", speed)
+	}
+	if needsAudioSwap {
+		// Standard CUE/BIN CD-DA is little-endian; cdrdao's raw audio input
+		// defaults to big-endian. --swap applies to AUDIO tracks only, leaving
+		// mixed-mode data sectors unchanged.
+		args = append(args, "--swap")
+	}
+	args = append(args, burnDescription)
+	cmd := exec.Command(helper("cdrdao"), args...)
+	cmd.Dir = burnDir
+	if err := a.runJob("BURNING DISC", cmd); err != nil {
+		a.message("BURN FAILED", []string{err.Error()})
+		return
+	}
+	a.message("BURN COMPLETE", []string{"The disc was written successfully."})
+}
+
 func (a *App) burnCue() {
 	root, ok := a.chooseStorage("SELECT CUE SOURCE")
 	if !ok {
@@ -1535,18 +1819,7 @@ func (a *App) burnCue() {
 	if !ok {
 		return
 	}
-	args := []string{"write", "--device", device, "--eject", "-n"}
-	if speed != "" {
-		args = append(args, "--speed", speed)
-	}
-	args = append(args, cue)
-	cmd := exec.Command(helper("cdrdao"), args...)
-	cmd.Dir = filepath.Dir(cue)
-	if err := a.runJob("BURNING DISC", cmd); err != nil {
-		a.message("BURN FAILED", []string{err.Error()})
-		return
-	}
-	a.message("BURN COMPLETE", []string{"The disc was written successfully."})
+	a.burnCuePrepared(cue, speed)
 }
 func (a *App) burnCHD() {
 	if err := checkHelper("chdman"); err != nil {
@@ -1580,18 +1853,7 @@ func (a *App) burnCHD() {
 	a.burnCuePath(cue, speed)
 }
 func (a *App) burnCuePath(cue, speed string) {
-	args := []string{"write", "--device", device, "--eject", "-n"}
-	if speed != "" {
-		args = append(args, "--speed", speed)
-	}
-	args = append(args, cue)
-	cmd := exec.Command(helper("cdrdao"), args...)
-	cmd.Dir = filepath.Dir(cue)
-	if err := a.runJob("BURNING DISC", cmd); err != nil {
-		a.message("BURN FAILED", []string{err.Error()})
-		return
-	}
-	a.message("BURN COMPLETE", []string{"The disc was written successfully."})
+	a.burnCuePrepared(cue, speed)
 }
 
 func copyTree(src, dst string) error {
