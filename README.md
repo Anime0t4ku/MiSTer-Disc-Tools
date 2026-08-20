@@ -4,6 +4,8 @@ Disc Tools is a native MiSTer utility for ripping and burning physical CDs direc
 
 It is designed for game discs, mixed-mode discs with CD audio, CHD images, and MSU1 / MD+ data discs. Disc Tools runs directly on MiSTer using the framebuffer and controller, so no desktop environment is required.
 
+Controller input uses MiSTer's system-wide controller mappings when available, so pads configured through MiSTer use the same logical D-pad and A/B layout in Disc Tools. The direct Linux input handling remains available as a fallback when no MiSTer map exists.
+
 ## Important: CHD processing on MiSTer is slow
 
 > **CHD creation and extraction can take a long time on MiSTer.**

@@ -23,7 +23,7 @@ import (
 )
 
 const (
-	version        = "1.2.0"
+	version        = "1.3.0"
 	baseDir        = "/media/fat/Scripts/.config/disctools"
 	binDir         = baseDir + "/bin"
 	tempDir        = baseDir + "/temp"
@@ -360,10 +360,14 @@ func inputLoop(ch chan<- action, done <-chan struct{}) {
 		if e != nil {
 			continue
 		}
+		misterMap := loadMisterControllerMap(p)
 		const grab = 0x40044590
 		_, _, _ = syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), grab, 1)
-		go func(f *os.File) {
-			defer f.Close()
+		go func(f *os.File, misterMap *misterControllerMap) {
+			defer func() {
+				_, _, _ = syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), grab, 0)
+				f.Close()
+			}()
 			var hx, hy int32
 			pressed := map[uint16]bool{}
 			for {
@@ -376,6 +380,14 @@ func inputLoop(ch chan<- action, done <-chan struct{}) {
 				if binary.Read(f, binary.LittleEndian, &ev) != nil {
 					return
 				}
+
+				if misterMap != nil {
+					if a, handled, _ := misterMap.process(f, ev); handled {
+						emit(a)
+						continue
+					}
+				}
+
 				a := actNone
 				if ev.Type == evKey {
 					if ev.Value == 0 {
@@ -433,7 +445,7 @@ func inputLoop(ch chan<- action, done <-chan struct{}) {
 				}
 				emit(a)
 			}
-		}(f)
+		}(f, misterMap)
 	}
 }
 
