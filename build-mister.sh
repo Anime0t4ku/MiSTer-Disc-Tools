@@ -2,7 +2,7 @@
 set -eu
 cd "$(dirname "$0")"
 
-VERSION="1.3.0"
+VERSION="1.4.0"
 TOOLCHAIN="/opt/gcc-arm-10.2-2020.11-x86_64-arm-none-linux-gnueabihf/bin"
 [ -d "$TOOLCHAIN" ] && PATH="$TOOLCHAIN:$PATH"
 export PATH

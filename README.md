@@ -42,6 +42,21 @@ Available speeds are:
 
 Disc Tools uses `cdrdao` for the physical write.
 
+If a used CD-RW is inserted, Disc Tools can perform a fast erase and continue
+with the selected burn automatically. Blank CD-R and CD-RW media use the same
+burning workflow.
+
+### Erase a CD-RW
+
+Choose **Erase CD-RW** from the main menu to reuse rewritable media. **Fast
+Erase** prepares the disc for another burn and is the recommended default.
+**Full Erase** erases the complete medium and takes considerably longer.
+
+Disc Tools verifies that the inserted medium is a CD-RW before erasing it and
+checks that the drive reports it as blank afterwards. Erasing cannot be safely
+cancelled once the drive has accepted the command, so the progress screen stays
+active until the drive finishes.
+
 ### Burn a CHD image
 
 Choose **Burn Disc → CHD Image** and select the CHD file.

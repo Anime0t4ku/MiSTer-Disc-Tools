@@ -23,7 +23,7 @@ import (
 )
 
 const (
-	version        = "1.3.1"
+	version        = "1.4.0"
 	baseDir        = "/media/fat/Scripts/.config/disctools"
 	binDir         = baseDir + "/bin"
 	tempDir        = baseDir + "/temp"
@@ -941,6 +941,8 @@ func jobStatus(title string, finalizing bool) string {
 		return "Building data disc image"
 	case "BURNING DATA DISC":
 		return "Writing data disc"
+	case "ERASING CD-RW":
+		return "Erasing rewritable disc"
 	default:
 		return "Processing"
 	}
@@ -1012,6 +1014,8 @@ func (a *App) runJob(title string, cmd *exec.Cmd) error {
 		defer lf.Close()
 		fmt.Fprintf(lf, "\n[%s] %s\n", time.Now().Format(time.RFC3339), strings.Join(cmd.Args, " "))
 	}
+	isCdrdaoBlank := len(cmd.Args) >= 2 && filepath.Base(cmd.Args[0]) == "cdrdao" && cmd.Args[1] == "blank"
+
 	// Present the next operation before starting the helper. This prevents the
 	// completed frame from the previous job (notably RIP 100%) from remaining
 	// on screen while the next helper is being launched or initialized.
@@ -1024,7 +1028,11 @@ func (a *App) runJob(title string, cmd *exec.Cmd) error {
 	a.fb.text(centeredX(a.fb.w, opScale, title), opY, opScale, title, fg)
 	a.fb.text(centeredX(a.fb.w, workScale, "STARTING..."), opY+90, workScale, "STARTING...", fg)
 	a.fb.text(centeredX(a.fb.w, 1, jobStatus(title, false)), opY+175, 1, jobStatus(title, false), fg)
-	a.footer("B/ESC Cancel")
+	if isCdrdaoBlank {
+		a.footer("Erasing cannot be cancelled - do not eject")
+	} else {
+		a.footer("B/ESC Cancel")
+	}
 	a.present()
 
 	pr, pw := io.Pipe()
@@ -1082,6 +1090,15 @@ func (a *App) runJob(title string, cmd *exec.Cmd) error {
 	fileName := jobDisplayFile(cmd.Args)
 	started := time.Now()
 	spin := 0
+	blankMode := "Fast erase in progress"
+	if isCdrdaoBlank {
+		for i := 0; i+1 < len(cmd.Args); i++ {
+			if cmd.Args[i] == "--blank-mode" && cmd.Args[i+1] == "full" {
+				blankMode = "Full erase in progress"
+				break
+			}
+		}
+	}
 
 	handleOutput := func(s string) {
 		rememberOutput(s)
@@ -1180,6 +1197,34 @@ func (a *App) runJob(title string, cmd *exec.Cmd) error {
 			}
 			elapsed := "Elapsed " + time.Since(started).Round(time.Second).String()
 			a.fb.text(centeredX(a.fb.w, 1, elapsed), detailY, 1, elapsed, dim)
+		} else if isCdrdaoBlank {
+			// cdrdao's command-line blank operation does not expose real media
+			// progress. Keep the standard Disc Tools progress-bar presentation,
+			// but animate a moving segment rather than inventing a percentage.
+			workScale := max(3, a.fb.h/180)
+			erasing := "ERASING" + strings.Repeat(".", spin%4)
+			a.fb.text(centeredX(a.fb.w, workScale, erasing), opY+70, workScale, erasing, fg)
+
+			barW := max(260, (a.fb.w*3)/4)
+			if barW > a.fb.w-80 {
+				barW = a.fb.w - 80
+			}
+			barH := max(24, a.fb.h/28)
+			barX := (a.fb.w - barW) / 2
+			barY := opY + 145
+			a.fb.border(barX, barY, barW, barH, max(2, barH/10), dim)
+			innerMax := max(1, barW-8)
+			segmentW := max(24, innerMax/4)
+			travel := max(1, innerMax-segmentW)
+			phase := (spin * max(2, travel/30)) % (travel * 2)
+			if phase > travel {
+				phase = travel*2 - phase
+			}
+			a.fb.rect(barX+4+phase, barY+4, segmentW, max(1, barH-8), fg)
+
+			a.fb.text(centeredX(a.fb.w, statusScale, blankMode), barY+barH+35, statusScale, blankMode, fg)
+			elapsed := "Elapsed " + time.Since(started).Round(time.Second).String()
+			a.fb.text(centeredX(a.fb.w, 1, elapsed), barY+barH+69, 1, elapsed, dim)
 		} else {
 			working := "WORKING" + strings.Repeat(".", spin%4)
 			workScale := max(3, a.fb.h/180)
@@ -1196,7 +1241,11 @@ func (a *App) runJob(title string, cmd *exec.Cmd) error {
 			a.fb.text(centeredX(a.fb.w, 1, elapsed), detailY, 1, elapsed, dim)
 		}
 
-		a.footer("B/ESC Cancel")
+		if isCdrdaoBlank {
+			a.footer("Erasing cannot be cancelled - do not eject")
+		} else {
+			a.footer("B/ESC Cancel")
+		}
 		a.present()
 
 		select {
@@ -1267,7 +1316,7 @@ func (a *App) runJob(title string, cmd *exec.Cmd) error {
 				}
 			}
 		case x := <-a.acts:
-			if x == actBack {
+			if x == actBack && !isCdrdaoBlank {
 				_ = cmd.Process.Kill()
 				<-done
 				return errors.New("cancelled")
@@ -1391,6 +1440,133 @@ func (a *App) eject() {
 			_ = exec.Command("eject", device).Run()
 		}
 	}
+}
+
+type discMediaInfo struct {
+	cdrwKnown  bool
+	cdrw       bool
+	emptyKnown bool
+	empty      bool
+}
+
+func parseDiscMediaInfo(out string) discMediaInfo {
+	var info discMediaInfo
+	for _, line := range strings.Split(out, "\n") {
+		parts := strings.SplitN(line, ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		key := strings.TrimSpace(parts[0])
+		value := strings.ToLower(strings.TrimSpace(parts[1]))
+		switch key {
+		case "CD-RW":
+			if value == "yes" || value == "no" {
+				info.cdrwKnown = true
+				info.cdrw = value == "yes"
+			}
+		case "CD-R empty":
+			if value == "yes" || value == "no" {
+				info.emptyKnown = true
+				info.empty = value == "yes"
+			}
+		}
+	}
+	return info
+}
+
+func (a *App) readDiscMediaInfo() (discMediaInfo, error) {
+	cmd := exec.Command(helper("cdrdao"), "disk-info", "--device", device)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		detail := strings.TrimSpace(string(out))
+		if detail != "" {
+			return discMediaInfo{}, fmt.Errorf("%v\n%s", err, detail)
+		}
+		return discMediaInfo{}, err
+	}
+	info := parseDiscMediaInfo(string(out))
+	if !info.cdrwKnown || !info.emptyKnown {
+		return info, errors.New("the inserted media type could not be determined")
+	}
+	return info, nil
+}
+
+func (a *App) eraseCDRW(mode string) error {
+	cmd := exec.Command(helper("cdrdao"), "blank", "--device", device, "--blank-mode", mode)
+	if err := a.runJob("ERASING CD-RW", cmd); err != nil {
+		return err
+	}
+	info, err := a.readDiscMediaInfo()
+	if err != nil {
+		return fmt.Errorf("erase completed, but the disc could not be verified: %w", err)
+	}
+	if !info.cdrw || !info.empty {
+		return errors.New("the drive did not report the CD-RW as blank after erasing")
+	}
+	return nil
+}
+
+func (a *App) eraseDisc() {
+	if err := checkHelper("cdrdao"); err != nil {
+		a.message("DEPENDENCY", []string{err.Error()})
+		return
+	}
+	info, err := a.readDiscMediaInfo()
+	if err != nil {
+		a.message("CD-RW CHECK FAILED", []string{"Unable to identify the inserted disc.", err.Error()})
+		return
+	}
+	if !info.cdrw {
+		a.message("NOT A CD-RW", []string{"The inserted disc is not rewritable and cannot be erased."})
+		return
+	}
+	if info.empty {
+		a.message("CD-RW ALREADY BLANK", []string{"The inserted CD-RW is already ready for burning."})
+		return
+	}
+	i, ok := a.menu("ERASE CD-RW", []string{"FAST ERASE", "FULL ERASE"}, 0)
+	if !ok {
+		return
+	}
+	mode := "minimal"
+	label := "FAST"
+	if i == 1 {
+		mode = "full"
+		label = "FULL"
+	}
+	i, ok = a.menu("CONFIRM "+label+" ERASE", []string{"ERASE CD-RW", "CANCEL"}, 1)
+	if !ok || i != 0 {
+		return
+	}
+	if err := a.eraseCDRW(mode); err != nil {
+		a.message("ERASE FAILED", []string{err.Error(), "The CD-RW may need to be erased again."})
+		return
+	}
+	a.message("ERASE COMPLETE", []string{"The CD-RW was erased successfully and is ready for burning."})
+}
+
+func (a *App) prepareBurnMedia() bool {
+	info, err := a.readDiscMediaInfo()
+	if err != nil {
+		a.message("DISC CHECK FAILED", []string{"Unable to verify that the inserted disc is writable.", err.Error()})
+		return false
+	}
+	if info.empty {
+		return true
+	}
+	if !info.cdrw {
+		a.message("DISC IS NOT BLANK", []string{"Insert a blank CD-R or CD-RW before burning."})
+		return false
+	}
+	i, ok := a.menu("USED CD-RW DETECTED", []string{"FAST ERASE AND CONTINUE", "CANCEL"}, 1)
+	if !ok || i != 0 {
+		return false
+	}
+	if err := a.eraseCDRW("minimal"); err != nil {
+		a.message("ERASE FAILED", []string{err.Error(), "Burning was not started."})
+		return false
+	}
+	return true
 }
 
 func safeBaseName(s string) string {
@@ -1831,6 +2007,9 @@ func (a *App) burnCue() {
 	if !ok {
 		return
 	}
+	if !a.prepareBurnMedia() {
+		return
+	}
 	a.burnCuePrepared(cue, speed)
 }
 func (a *App) burnCHD() {
@@ -1851,6 +2030,9 @@ func (a *App) burnCHD() {
 	}
 	speed, ok := a.chooseBurnSpeed()
 	if !ok {
+		return
+	}
+	if !a.prepareBurnMedia() {
 		return
 	}
 	job := filepath.Join(tempDir, "chd-burn-"+strconv.FormatInt(time.Now().UnixNano(), 10))
@@ -2262,6 +2444,9 @@ func (a *App) burnDataFolder() {
 	if !ok {
 		return
 	}
+	if !a.prepareBurnMedia() {
+		return
+	}
 	job := filepath.Join(tempDir, "data-burn-"+strconv.FormatInt(time.Now().UnixNano(), 10))
 	stage := filepath.Join(job, "disc")
 	iso := filepath.Join(job, "disc.iso")
@@ -2551,7 +2736,7 @@ func screenSaverInputLoop(fb *framebuffer, raw <-chan action, out chan<- action,
 
 func (a *App) mainMenu() {
 	for {
-		i, ok := a.menuWithBack("DISC TOOLS V"+version, []string{"RIP PHYSICAL DISC", "BURN DISC", "EJECT DISC", "", "SETTINGS", "", "EXIT"}, 0, false)
+		i, ok := a.menuWithBack("DISC TOOLS V"+version, []string{"RIP PHYSICAL DISC", "BURN DISC", "ERASE CD-RW", "EJECT DISC", "", "SETTINGS", "", "EXIT"}, 0, false)
 		if !ok {
 			return
 		}
@@ -2561,10 +2746,12 @@ func (a *App) mainMenu() {
 		case 1:
 			a.burnDisc()
 		case 2:
+			a.eraseDisc()
+		case 3:
 			a.eject()
-		case 4:
+		case 5:
 			a.settingsUI()
-		case 6:
+		case 7:
 			return
 		}
 	}
