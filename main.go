@@ -1928,7 +1928,20 @@ func parseSingleBinCueLayout(cue string) (string, []cueTrackLayout, error) {
 	return source, tracks, nil
 }
 
-func copyFileRange(src, dst string, offset, length int64) error {
+type cueStageRange struct {
+	dst    string
+	offset int64
+	length int64
+	track  int
+}
+
+type cueStageProgress struct {
+	copied int64
+	track  int
+	file   string
+}
+
+func copyFileRangeCancelable(src, dst string, offset, length int64, cancel <-chan struct{}, onBytes func(int64)) error {
 	if offset < 0 || length < 0 {
 		return errors.New("invalid CUE track range")
 	}
@@ -1944,12 +1957,159 @@ func copyFileRange(src, dst string, offset, length int64) error {
 	if err != nil {
 		return err
 	}
-	_, copyErr := io.CopyN(out, in, length)
-	closeErr := out.Close()
-	if copyErr != nil {
-		return copyErr
+	buf := make([]byte, 1024*1024)
+	remaining := length
+	for remaining > 0 {
+		select {
+		case <-cancel:
+			_ = out.Close()
+			return errors.New("cancelled")
+		default:
+		}
+		want := int64(len(buf))
+		if remaining < want {
+			want = remaining
+		}
+		n, readErr := in.Read(buf[:int(want)])
+		if n > 0 {
+			if _, err = out.Write(buf[:n]); err != nil {
+				_ = out.Close()
+				return err
+			}
+			remaining -= int64(n)
+			if onBytes != nil {
+				onBytes(int64(n))
+			}
+		}
+		if readErr == io.EOF && remaining > 0 {
+			_ = out.Close()
+			return io.ErrUnexpectedEOF
+		}
+		if readErr != nil && readErr != io.EOF {
+			_ = out.Close()
+			return readErr
+		}
 	}
-	return closeErr
+	return out.Close()
+}
+
+func (a *App) copyCueRangesWithProgress(src string, ranges []cueStageRange, title string) error {
+	var total int64
+	for _, r := range ranges {
+		total += r.length
+	}
+	if total <= 0 {
+		return errors.New("CUE staging contains no data")
+	}
+
+	updates := make(chan cueStageProgress, 32)
+	done := make(chan error, 1)
+	cancel := make(chan struct{})
+	var cancelOnce sync.Once
+	stop := func() { cancelOnce.Do(func() { close(cancel) }) }
+
+	go func() {
+		var copied int64
+		lastSent := int64(-1)
+		for _, r := range ranges {
+			select {
+			case <-cancel:
+				done <- errors.New("cancelled")
+				return
+			default:
+			}
+			select {
+			case updates <- cueStageProgress{copied: copied, track: r.track, file: filepath.Base(r.dst)}:
+			default:
+			}
+			err := copyFileRangeCancelable(src, r.dst, r.offset, r.length, cancel, func(n int64) {
+				copied += n
+				mb := copied / (1024 * 1024)
+				if mb != lastSent || copied >= total {
+					lastSent = mb
+					select {
+					case updates <- cueStageProgress{copied: copied, track: r.track, file: filepath.Base(r.dst)}:
+					default:
+					}
+				}
+			})
+			if err != nil {
+				done <- err
+				return
+			}
+		}
+		done <- nil
+	}()
+
+	current := int64(0)
+	currentTrack := 1
+	currentFile := filepath.Base(src)
+	started := time.Now()
+	tick := time.NewTicker(100 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		a.fb.fill(a.background())
+		a.title("DISC TOOLS V" + version)
+		opScale := max(2, a.fb.h/240)
+		pctScale := max(4, a.fb.h/145)
+		statusScale := max(1, a.fb.h/360)
+		centerY := a.fb.h / 2
+		opY := centerY - max(155, a.fb.h/5)
+		a.fb.text(centeredX(a.fb.w, opScale, title), opY, opScale, title, fg)
+
+		pct := float64(current) * 100 / float64(total)
+		if pct > 100 {
+			pct = 100
+		}
+		pctText := fmt.Sprintf("%.1f%%", pct)
+		a.fb.text(centeredX(a.fb.w, pctScale, pctText), opY+70, pctScale, pctText, fg)
+		barW := max(260, (a.fb.w*3)/4)
+		if barW > a.fb.w-80 {
+			barW = a.fb.w - 80
+		}
+		barH := max(24, a.fb.h/28)
+		barX := (a.fb.w - barW) / 2
+		barY := opY + 145
+		a.fb.border(barX, barY, barW, barH, max(2, barH/10), dim)
+		innerMax := max(0, barW-8)
+		inner := int(float64(innerMax) * pct / 100)
+		if inner > 0 {
+			a.fb.rect(barX+4, barY+4, inner, max(1, barH-8), fg)
+		}
+
+		amount := fmt.Sprintf("%.1f MB / %.1f MB", float64(current)/(1024*1024), float64(total)/(1024*1024))
+		a.fb.text(centeredX(a.fb.w, statusScale, amount), barY+barH+35, statusScale, amount, fg)
+		trackText := fmt.Sprintf("Track %d / %d", currentTrack, len(ranges))
+		a.fb.text(centeredX(a.fb.w, 1, trackText), barY+barH+69, 1, trackText, dim)
+		name := short(currentFile, max(24, (a.fb.w-100)/6))
+		a.fb.text(centeredX(a.fb.w, 1, name), barY+barH+91, 1, name, dim)
+		elapsed := "Elapsed " + time.Since(started).Round(time.Second).String()
+		a.fb.text(centeredX(a.fb.w, 1, elapsed), barY+barH+113, 1, elapsed, dim)
+		a.footer("B/ESC Cancel")
+		a.present()
+
+		select {
+		case u := <-updates:
+			current = u.copied
+			currentTrack = u.track
+			currentFile = u.file
+		case err := <-done:
+			if err == nil {
+				current = total
+			}
+			return err
+		case <-tick.C:
+		case x := <-a.acts:
+			if x == actBack {
+				stop()
+				err := <-done
+				if err == nil {
+					err = errors.New("cancelled")
+				}
+				return err
+			}
+		}
+	}
 }
 
 // stageRobustCueTOC handles single-BIN raw mixed-mode CUEs that neither
@@ -1993,6 +2153,7 @@ func (a *App) stageRobustCueTOC(cue string) (string, func(), error) {
 		toc.WriteString("CD_ROM\n\n")
 	}
 
+	ranges := make([]cueStageRange, 0, len(tracks))
 	for i, tr := range tracks {
 		startBlock := tr.index01
 		if tr.hasIndex00 {
@@ -2013,10 +2174,12 @@ func (a *App) stageRobustCueTOC(cue string) (string, func(), error) {
 
 		trackFile := fmt.Sprintf("track%02d.bin", tr.number)
 		trackPath := filepath.Join(dir, trackFile)
-		if err := copyFileRange(source, trackPath, startBlock*2352, (endBlock-startBlock)*2352); err != nil {
-			cleanup()
-			return "", func() {}, fmt.Errorf("track %02d staging failed: %w", tr.number, err)
-		}
+		ranges = append(ranges, cueStageRange{
+			dst:    trackPath,
+			offset: startBlock * 2352,
+			length: (endBlock - startBlock) * 2352,
+			track:  tr.number,
+		})
 
 		tocMode := ""
 		switch tr.mode {
@@ -2043,6 +2206,11 @@ func (a *App) stageRobustCueTOC(cue string) (string, func(), error) {
 			}
 		}
 		toc.WriteString("\n")
+	}
+
+	if err := a.copyCueRangesWithProgress(source, ranges, "PREPARING CUE"); err != nil {
+		cleanup()
+		return "", func() {}, err
 	}
 
 	tocPath := filepath.Join(dir, "image.toc")
