@@ -23,7 +23,7 @@ import (
 )
 
 const (
-	version        = "1.4.0"
+	version        = "1.4.1"
 	baseDir        = "/media/fat/Scripts/.config/disctools"
 	binDir         = baseDir + "/bin"
 	tempDir        = baseDir + "/temp"
@@ -1783,6 +1783,276 @@ func cueSingleBinaryFile(cue string) string {
 	return name
 }
 
+type cueTrackLayout struct {
+	number     int
+	mode       string
+	index00    int64
+	index01    int64
+	hasIndex00 bool
+	hasIndex01 bool
+	pregap     int64
+	hasPregap  bool
+}
+
+func cueMSFBlocks(v string) (int64, error) {
+	parts := strings.Split(strings.TrimSpace(v), ":")
+	if len(parts) != 3 {
+		return 0, fmt.Errorf("invalid CUE time %q", v)
+	}
+	mm, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid CUE time %q", v)
+	}
+	ss, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil || ss < 0 || ss >= 60 {
+		return 0, fmt.Errorf("invalid CUE time %q", v)
+	}
+	ff, err := strconv.ParseInt(parts[2], 10, 64)
+	if err != nil || ff < 0 || ff >= 75 {
+		return 0, fmt.Errorf("invalid CUE time %q", v)
+	}
+	return (mm*60+ss)*75 + ff, nil
+}
+
+func cueBlocksMSF(blocks int64) string {
+	if blocks < 0 {
+		blocks = 0
+	}
+	mm := blocks / (60 * 75)
+	rest := blocks % (60 * 75)
+	ss := rest / 75
+	ff := rest % 75
+	return fmt.Sprintf("%02d:%02d:%02d", mm, ss, ff)
+}
+
+func parseSingleBinCueLayout(cue string) (string, []cueTrackLayout, error) {
+	b, err := os.ReadFile(cue)
+	if err != nil {
+		return "", nil, err
+	}
+	fileRE := regexp.MustCompile(`(?i)^\s*FILE\s+(?:"([^"]+)"|(\S+))\s+(\S+)\s*$`)
+	trackRE := regexp.MustCompile(`(?i)^\s*TRACK\s+(\d+)\s+(\S+)\s*$`)
+	indexRE := regexp.MustCompile(`(?i)^\s*INDEX\s+(\d+)\s+(\d{1,3}:\d{1,2}:\d{1,2})\s*$`)
+	pregapRE := regexp.MustCompile(`(?i)^\s*PREGAP\s+(\d{1,3}:\d{1,2}:\d{1,2})\s*$`)
+	unsupportedRE := regexp.MustCompile(`(?i)^\s*(POSTGAP|FLAGS|ISRC|CATALOG|CDTEXTFILE|TITLE|PERFORMER|SONGWRITER)\b`)
+
+	var source string
+	fileCount := 0
+	var tracks []cueTrackLayout
+	current := -1
+	for _, raw := range strings.Split(string(b), "\n") {
+		line := strings.TrimRight(raw, "\r")
+		if m := unsupportedRE.FindStringSubmatch(line); len(m) == 2 {
+			return "", nil, fmt.Errorf("CUE directive %s requires the compatibility fallback", strings.ToUpper(m[1]))
+		}
+		if m := fileRE.FindStringSubmatch(line); len(m) == 4 {
+			fileCount++
+			if !strings.EqualFold(m[3], "BINARY") {
+				return "", nil, fmt.Errorf("robust CUE fallback supports BINARY images only")
+			}
+			name := m[1]
+			if name == "" {
+				name = m[2]
+			}
+			source = name
+			continue
+		}
+		if m := trackRE.FindStringSubmatch(line); len(m) == 3 {
+			n, _ := strconv.Atoi(m[1])
+			tracks = append(tracks, cueTrackLayout{number: n, mode: strings.ToUpper(m[2])})
+			current = len(tracks) - 1
+			continue
+		}
+		if current < 0 {
+			continue
+		}
+		if m := indexRE.FindStringSubmatch(line); len(m) == 3 {
+			idx, _ := strconv.Atoi(m[1])
+			if idx > 1 {
+				return "", nil, fmt.Errorf("INDEX %02d requires the compatibility fallback", idx)
+			}
+			blocks, err := cueMSFBlocks(m[2])
+			if err != nil {
+				return "", nil, err
+			}
+			switch idx {
+			case 0:
+				tracks[current].index00 = blocks
+				tracks[current].hasIndex00 = true
+			case 1:
+				tracks[current].index01 = blocks
+				tracks[current].hasIndex01 = true
+			}
+			continue
+		}
+		if m := pregapRE.FindStringSubmatch(line); len(m) == 2 {
+			blocks, err := cueMSFBlocks(m[1])
+			if err != nil {
+				return "", nil, err
+			}
+			tracks[current].pregap = blocks
+			tracks[current].hasPregap = true
+		}
+	}
+	if fileCount != 1 || source == "" {
+		return "", nil, fmt.Errorf("robust CUE fallback requires exactly one BINARY FILE")
+	}
+	if len(tracks) == 0 {
+		return "", nil, fmt.Errorf("CUE contains no tracks")
+	}
+	if !filepath.IsAbs(source) {
+		source = filepath.Join(filepath.Dir(cue), filepath.FromSlash(source))
+	}
+	if st, err := os.Stat(source); err != nil || st.IsDir() {
+		if err != nil {
+			return "", nil, fmt.Errorf("CUE BIN not found: %w", err)
+		}
+		return "", nil, fmt.Errorf("CUE BIN path is not a file")
+	}
+	for i := range tracks {
+		if !tracks[i].hasIndex01 {
+			return "", nil, fmt.Errorf("track %02d has no INDEX 01", tracks[i].number)
+		}
+		switch tracks[i].mode {
+		case "AUDIO", "MODE1/2352", "MODE2/2352":
+		default:
+			return "", nil, fmt.Errorf("track %02d mode %s is not supported by robust fallback", tracks[i].number, tracks[i].mode)
+		}
+		if tracks[i].hasIndex00 && tracks[i].index00 > tracks[i].index01 {
+			return "", nil, fmt.Errorf("track %02d INDEX 00 is after INDEX 01", tracks[i].number)
+		}
+		if tracks[i].hasPregap && tracks[i].hasIndex00 {
+			return "", nil, fmt.Errorf("track %02d uses both PREGAP and INDEX 00", tracks[i].number)
+		}
+	}
+	return source, tracks, nil
+}
+
+func copyFileRange(src, dst string, offset, length int64) error {
+	if offset < 0 || length < 0 {
+		return errors.New("invalid CUE track range")
+	}
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	if _, err := in.Seek(offset, io.SeekStart); err != nil {
+		return err
+	}
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	_, copyErr := io.CopyN(out, in, length)
+	closeErr := out.Close()
+	if copyErr != nil {
+		return copyErr
+	}
+	return closeErr
+}
+
+// stageRobustCueTOC handles single-BIN raw mixed-mode CUEs that neither
+// cdrdao's CUE parser nor cue2toc can represent. It splits the raw image at
+// CUE track boundaries and creates a native cdrdao TOC while preserving both
+// generated PREGAPs and file-backed INDEX 00 -> INDEX 01 pregap data.
+func (a *App) stageRobustCueTOC(cue string) (string, func(), error) {
+	source, tracks, err := parseSingleBinCueLayout(cue)
+	if err != nil {
+		return "", func() {}, err
+	}
+	info, err := os.Stat(source)
+	if err != nil {
+		return "", func() {}, err
+	}
+	if info.Size()%2352 != 0 {
+		return "", func() {}, fmt.Errorf("single-BIN raw image size is not aligned to 2352-byte sectors")
+	}
+	totalBlocks := info.Size() / 2352
+
+	if err := os.MkdirAll(tempDir, 0755); err != nil {
+		return "", func() {}, err
+	}
+	dir, err := os.MkdirTemp(tempDir, "cue-layout-")
+	if err != nil {
+		return "", func() {}, err
+	}
+	cleanup := func() { _ = os.RemoveAll(dir) }
+
+	var toc strings.Builder
+	hasMode2 := false
+	for _, tr := range tracks {
+		if tr.mode == "MODE2/2352" {
+			hasMode2 = true
+			break
+		}
+	}
+	if hasMode2 {
+		toc.WriteString("CD_ROM_XA\n\n")
+	} else {
+		toc.WriteString("CD_ROM\n\n")
+	}
+
+	for i, tr := range tracks {
+		startBlock := tr.index01
+		if tr.hasIndex00 {
+			startBlock = tr.index00
+		}
+		endBlock := totalBlocks
+		if i+1 < len(tracks) {
+			next := tracks[i+1]
+			endBlock = next.index01
+			if next.hasIndex00 {
+				endBlock = next.index00
+			}
+		}
+		if startBlock < 0 || endBlock <= startBlock || endBlock > totalBlocks {
+			cleanup()
+			return "", func() {}, fmt.Errorf("invalid sector range for track %02d", tr.number)
+		}
+
+		trackFile := fmt.Sprintf("track%02d.bin", tr.number)
+		trackPath := filepath.Join(dir, trackFile)
+		if err := copyFileRange(source, trackPath, startBlock*2352, (endBlock-startBlock)*2352); err != nil {
+			cleanup()
+			return "", func() {}, fmt.Errorf("track %02d staging failed: %w", tr.number, err)
+		}
+
+		tocMode := ""
+		switch tr.mode {
+		case "AUDIO":
+			tocMode = "AUDIO"
+		case "MODE1/2352":
+			tocMode = "MODE1_RAW"
+		case "MODE2/2352":
+			tocMode = "MODE2_RAW"
+		}
+		fmt.Fprintf(&toc, "TRACK %s\n", tocMode)
+		if tr.hasPregap && tr.pregap > 0 {
+			fmt.Fprintf(&toc, "PREGAP %s\n", cueBlocksMSF(tr.pregap))
+		}
+		if tr.mode == "AUDIO" {
+			fmt.Fprintf(&toc, "FILE \"%s\" 0\n", trackFile)
+		} else {
+			fmt.Fprintf(&toc, "DATAFILE \"%s\"\n", trackFile)
+		}
+		if tr.hasIndex00 {
+			pregapBlocks := tr.index01 - tr.index00
+			if pregapBlocks > 0 {
+				fmt.Fprintf(&toc, "START %s\n", cueBlocksMSF(pregapBlocks))
+			}
+		}
+		toc.WriteString("\n")
+	}
+
+	tocPath := filepath.Join(dir, "image.toc")
+	if err := os.WriteFile(tocPath, []byte(toc.String()), 0644); err != nil {
+		cleanup()
+		return "", func() {}, err
+	}
+	return tocPath, cleanup, nil
+}
+
 func (a *App) copyFileWithProgress(src, dst, title string) error {
 	info, err := os.Stat(src)
 	if err != nil {
@@ -1949,29 +2219,44 @@ func (a *App) burnCuePrepared(cue, speed string) {
 	burnDescription := nativeCue
 	burnDir := filepath.Dir(nativeCue)
 	if !a.cdrdaoAcceptsCue(nativeCue) {
-		if err := checkHelper("cue2toc"); err != nil {
-			a.message("DEPENDENCY", []string{err.Error()})
-			return
+		// Once the native CUE path has failed, discard any full-image staging
+		// copy before creating the per-track fallback. This avoids requiring
+		// space for two complete temporary copies on FAT/exFAT media.
+		cleanupNative()
+		cleanupNative = func() {}
+
+		robustTOC, cleanupRobust, robustErr := a.stageRobustCueTOC(cue)
+		if robustErr == nil {
+			defer cleanupRobust()
+			burnDescription = robustTOC
+			burnDir = filepath.Dir(robustTOC)
+		} else {
+			// Keep cue2toc as the final compatibility fallback for layouts that
+			// are outside the conservative single-BIN raw parser above.
+			if err := checkHelper("cue2toc"); err != nil {
+				a.message("BURN FAILED", []string{"CUE layout is not supported by the robust fallback:", robustErr.Error(), err.Error()})
+				return
+			}
+			if err := os.MkdirAll(tempDir, 0755); err != nil {
+				a.message("BURN FAILED", []string{err.Error()})
+				return
+			}
+			tocDir, err := os.MkdirTemp(tempDir, "cue2toc-")
+			if err != nil {
+				a.message("BURN FAILED", []string{err.Error()})
+				return
+			}
+			defer os.RemoveAll(tocDir)
+			toc := filepath.Join(tocDir, "image.toc")
+			cmd := exec.Command(helper("cue2toc"), "-o", toc, cue)
+			cmd.Dir = filepath.Dir(cue)
+			if err := a.runJob("PREPARING CUE", cmd); err != nil {
+				a.message("BURN FAILED", []string{robustErr.Error(), err.Error()})
+				return
+			}
+			burnDescription = toc
+			burnDir = filepath.Dir(cue)
 		}
-		if err := os.MkdirAll(tempDir, 0755); err != nil {
-			a.message("BURN FAILED", []string{err.Error()})
-			return
-		}
-		tocDir, err := os.MkdirTemp(tempDir, "cue2toc-")
-		if err != nil {
-			a.message("BURN FAILED", []string{err.Error()})
-			return
-		}
-		defer os.RemoveAll(tocDir)
-		toc := filepath.Join(tocDir, "image.toc")
-		cmd := exec.Command(helper("cue2toc"), "-o", toc, cue)
-		cmd.Dir = filepath.Dir(cue)
-		if err := a.runJob("PREPARING CUE", cmd); err != nil {
-			a.message("BURN FAILED", []string{err.Error()})
-			return
-		}
-		burnDescription = toc
-		burnDir = filepath.Dir(cue)
 	}
 
 	args := []string{"write", "--device", device, "--eject", "-n"}

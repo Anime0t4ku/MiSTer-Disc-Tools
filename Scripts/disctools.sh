@@ -1,5 +1,5 @@
 #!/bin/bash
-VERSION="1.4.0"
+VERSION="1.4.1"
 BASE="/media/fat/Scripts/.config/disctools"
 BIN="$BASE/disctools"
 
