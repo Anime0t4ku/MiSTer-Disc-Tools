@@ -1705,7 +1705,9 @@ func (a *App) ripDisc() {
 	subStatus := ""
 	cmd := exec.Command(helper("cdrdao"), "read-cd", "--device", device, "--read-raw", "--read-subchan", "rw_raw", "--datafile", bin, toc)
 	if err := a.runJob("RIPPING PHYSICAL DISC", cmd); err != nil {
-		if err.Error() == "cancelled" {
+		// Retry without subchannel only when the drive rejected subchannel
+		// reading; any other failure (no disc, read error, cancel) is final.
+		if !strings.Contains(strings.ToLower(err.Error()), "sub-channel") {
 			a.message("RIP FAILED", []string{err.Error(), "Partial files were kept."})
 			return
 		}

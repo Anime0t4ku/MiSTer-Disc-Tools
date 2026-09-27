@@ -279,18 +279,29 @@ func writeSubchannelBack(bin string, subs []byte, frames int, cancel <-chan stru
 		return err
 	}
 	defer f.Close()
-	for i := 0; i < frames; i++ {
-		if i%subChunkFrames == 0 {
-			select {
-			case <-cancel:
-				return errors.New("cancelled")
-			default:
-			}
+	// Rewrite whole blocks of sectors: thousands of 96-byte writes are very
+	// slow on SD cards and USB sticks, large sequential writes are not.
+	buf := make([]byte, subChunkFrames*rawSubStride)
+	// Not cancellable: stopping half way would leave a BIN whose subchannel
+	// is partly realigned. The pass takes about as long as the read pass.
+	_ = cancel
+	for start := 0; start < frames; start += subChunkFrames {
+		n := subChunkFrames
+		if start+n > frames {
+			n = frames - start
 		}
-		if _, err := f.WriteAt(subs[i*subLen:(i+1)*subLen], int64(i)*rawSubStride+rawSectorLen); err != nil {
+		block := buf[:n*rawSubStride]
+		off := int64(start) * rawSubStride
+		if _, err := f.ReadAt(block, off); err != nil {
 			return err
 		}
-		onBytes(rawSubStride)
+		for k := 0; k < n; k++ {
+			copy(block[k*rawSubStride+rawSectorLen:(k+1)*rawSubStride], subs[(start+k)*subLen:(start+k+1)*subLen])
+		}
+		if _, err := f.WriteAt(block, off); err != nil {
+			return err
+		}
+		onBytes(int64(len(block)))
 	}
 	return f.Sync()
 }
