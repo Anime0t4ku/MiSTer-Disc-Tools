@@ -27,6 +27,9 @@ const (
 	verifyMaxWindow = 26 // sectors per read command (64 KiB limit of many USB bridges)
 	verifyReads     = 3  // reads of every window
 	verifyMaxReads  = 12 // reads of a window whose broken Q values do not agree yet
+	// sectors that must go through the drive before a window is read again,
+	// so the drive cannot answer from its read cache (a few MB on most drives)
+	verifyCacheSectors = 4096
 )
 
 // subReader reads the raw P-W subchannel (96 bytes per sector) of count
@@ -121,77 +124,98 @@ func verifySubchannel(subs []byte, frames int, read subReader, cancel <-chan str
 	var res verifyResult
 	suspects := subSuspects(subs, frames)
 	res.Suspects = len(suspects)
+	windows := groupSuspects(suspects, frames)
 
-	for _, w := range groupSuspects(suspects, frames) {
-		select {
-		case <-cancel:
-			return res, errors.New("cancelled")
-		default:
+	type windowState struct {
+		verifyWindow
+		cands    map[int][]subCandidate
+		good     map[int][]byte
+		reads    int
+		readAt   int64 // value of sectorsRead when this window was last read
+		finished bool
+	}
+	states := make([]*windowState, len(windows))
+	for i, w := range windows {
+		states[i] = &windowState{verifyWindow: w, cands: map[int][]subCandidate{}, good: map[int][]byte{}, readAt: -verifyCacheSectors}
+	}
+
+	// sectorsRead counts every sector requested from the drive. A window is
+	// read again only after enough other sectors went through the drive to
+	// push it out of the drive's read cache: a cached copy would repeat the
+	// same read error and look like a real broken Q.
+	var sectorsRead int64
+	flushFar := func(ws *windowState) {
+		far := (ws.start + frames/2) % frames
+		for sectorsRead-ws.readAt < verifyCacheSectors {
+			if far+verifyMaxWindow > frames {
+				far = 0
+			}
+			_, _ = read(far, verifyMaxWindow)
+			sectorsRead += verifyMaxWindow
+			far += verifyMaxWindow
 		}
-		cands := make(map[int][]subCandidate, len(w.suspects))
-		good := make(map[int][]byte, len(w.suspects))
+	}
 
-		readOnce := func() {
-			raw, err := read(w.start, w.count)
-			if err != nil || len(raw) < w.count*subLen {
-				return
+	readOnce := func(ws *windowState) {
+		if sectorsRead-ws.readAt < verifyCacheSectors {
+			flushFar(ws)
+		}
+		raw, err := read(ws.start, ws.count)
+		sectorsRead += int64(ws.count)
+		ws.readAt = sectorsRead
+		ws.reads++
+		if err != nil || len(raw) < ws.count*subLen {
+			return
+		}
+		d, ok := windowPhase(raw, ws.start, ws.count)
+		if !ok {
+			return
+		}
+		for _, lba := range ws.suspects {
+			if ws.good[lba] != nil {
+				continue
 			}
-			d, ok := windowPhase(raw, w.start, w.count)
-			if !ok {
-				return
+			k := lba - d - ws.start
+			// skip the first entries of the command: some drives return
+			// a stale Q right after the seek
+			if k < 2 || k >= ws.count {
+				continue
 			}
-			for _, lba := range w.suspects {
-				if good[lba] != nil {
-					continue
+			e := raw[k*subLen : (k+1)*subLen]
+			q := qFromRaw(e)
+			if qCRCOK(q) {
+				if f, ok := qAbsFrame(q); ok && f == lba+150 {
+					ws.good[lba] = append([]byte(nil), e...)
 				}
-				k := lba - d - w.start
-				// skip the first entries of the command: some drives return
-				// a stale Q right after the seek
-				if k < 2 || k >= w.count {
-					continue
+				continue // a valid Q of another sector says nothing about this one
+			}
+			found := false
+			for i := range ws.cands[lba] {
+				if qFromRaw(ws.cands[lba][i].raw[:]) == q {
+					ws.cands[lba][i].n++
+					found = true
+					break
 				}
-				e := raw[k*subLen : (k+1)*subLen]
-				q := qFromRaw(e)
-				if qCRCOK(q) {
-					if f, ok := qAbsFrame(q); ok && f == lba+150 {
-						good[lba] = append([]byte(nil), e...)
-					}
-					continue // a valid Q of another sector says nothing about this one
-				}
+			}
+			if !found {
 				var c subCandidate
 				copy(c.raw[:], e)
-				found := false
-				for i := range cands[lba] {
-					if qFromRaw(cands[lba][i].raw[:]) == q {
-						cands[lba][i].n++
-						found = true
-						break
-					}
-				}
-				if !found {
-					c.n = 1
-					cands[lba] = append(cands[lba], c)
-				}
+				c.n = 1
+				ws.cands[lba] = append(ws.cands[lba], c)
 			}
 		}
+	}
 
-		for r := 0; r < verifyMaxReads; r++ {
-			readOnce()
-			if r+1 >= verifyReads && windowSettled(w.suspects, good, cands) {
-				break
-			}
-		}
-
-		for _, lba := range w.suspects {
+	finish := func(ws *windowState) {
+		ws.finished = true
+		for _, lba := range ws.suspects {
 			dst := subs[lba*subLen : (lba+1)*subLen]
-			if g := good[lba]; g != nil {
+			if g := ws.good[lba]; g != nil {
 				copy(dst, g)
 				res.Repaired++
-			} else if c := cands[lba]; len(c) > 0 {
+			} else if c := ws.cands[lba]; len(c) > 0 {
 				best := c[0]
-				total := 0
 				for _, x := range c {
-					total += x.n
 					if x.n > best.n {
 						best = x
 					}
@@ -209,7 +233,47 @@ func verifySubchannel(subs []byte, frames int, read subReader, cancel <-chan str
 			onSector()
 		}
 	}
+
+	// Read in passes over all windows spread across the disc, so the same
+	// window comes back only after hundreds of other reads.
+	for pass := 0; pass < verifyMaxReads; pass++ {
+		pending := 0
+		for _, ws := range states {
+			if ws.finished {
+				continue
+			}
+			select {
+			case <-cancel:
+				return res, errors.New("cancelled")
+			default:
+			}
+			readOnce(ws)
+			if ws.reads >= verifyReads && windowSettled(ws.suspects, ws.good, ws.cands) {
+				finish(ws)
+			} else {
+				pending++
+			}
+		}
+		if pending == 0 {
+			break
+		}
+	}
+	for _, ws := range states {
+		if !ws.finished {
+			finish(ws)
+		}
+	}
+	sortInts(res.Confirmed)
+	sortInts(res.Unresolved)
 	return res, nil
+}
+
+func sortInts(v []int) {
+	for i := 1; i < len(v); i++ {
+		for j := i; j > 0 && v[j] < v[j-1]; j-- {
+			v[j], v[j-1] = v[j-1], v[j]
+		}
+	}
 }
 
 // clearMajority is true when one broken Q was returned at least 3 times and

@@ -21,8 +21,29 @@ func TestVerifySubchannelRepairsFirstPass(t *testing.T) {
 		return raw
 	}
 	rng := rand.New(rand.NewSource(7))
+	// read cache: a command for the same sectors is answered from the cache
+	// (read errors included) until enough other sectors were read
+	type cached struct {
+		start, count int
+		at           int
+		data         []byte
+	}
+	var cache []cached
+	readTotal := 0
 	drive := func(lba, count int) ([]byte, error) {
+		readTotal += count
+		for _, c := range cache {
+			if c.start == lba && c.count == count && readTotal-c.at < 3000 {
+				return append([]byte(nil), c.data...), nil
+			}
+		}
 		out := make([]byte, count*subLen)
+		defer func() {
+			cache = append(cache, cached{lba, count, readTotal, append([]byte(nil), out...)})
+			if len(cache) > 64 {
+				cache = cache[1:]
+			}
+		}()
 		phase := -1
 		if rng.Intn(5) == 0 {
 			phase = 0
