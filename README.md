@@ -26,6 +26,15 @@ You can keep the rip as **BIN/CUE**, convert it to **CHD**, or create a CHD and 
 
 Disc Tools reads the disc in raw DAO mode so mixed-mode game discs and discs containing CDDA audio are preserved correctly.
 
+The raw subchannel (P-W) is read as well. It holds the position data (Q) of every sector, including the deliberately damaged Q sectors that some copy protections rely on, such as PSX LibCrypt. After the rip Disc Tools:
+
+- measures and corrects the constant subchannel offset that many drives have (the subchannel of a neighbouring sector is returned);
+- keeps the subchannel inside the CHD;
+- writes a CloneCD style `.sub` file next to the CUE/BIN (the CUE format cannot hold subchannel data);
+- writes a `.subq.log` report with the sectors whose Q CRC is broken (on a LibCrypt disc these are the protection sectors).
+
+If the drive cannot return raw subchannel data, the disc is ripped without it, as before.
+
 When CHD conversion is selected, the original rip is only removed **after the new CHD passes verification**. If conversion or verification fails, the BIN/CUE files are kept.
 
 ### Burn a BIN/CUE image
@@ -160,7 +169,7 @@ The completed MiSTer payload is placed under `Scripts/`.
 
 Disc Tools uses separate command-line utilities for disc imaging and burning rather than linking their code into the application.
 
-- **cdrdao 1.2.6** — GPL-2.0-or-later. Used for raw DAO CD ripping, CUE/TOC handling, and physical CD writing.
+- **cdrdao 1.2.6** — GPL-2.0-or-later. Used for raw DAO CD ripping, CUE/TOC handling, and physical CD writing. A small local patch (`patches/cdrdao-rw-raw-subchannel-scan.patch`) keeps pre-gap/index detection working while raw subchannel data is read.
 - **chdman** — MAME CHD tool. Used for CHD creation, verification, and extraction.
 - **GNU xorriso 1.5.6.pl02** — GPL-3.0-or-later. Used to create ISO 9660/Joliet images for MSU1 / MD+ data discs.
 
