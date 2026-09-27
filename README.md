@@ -24,6 +24,8 @@ Choose **Rip Physical Disc** from the main menu to create an image from the disc
 
 You can keep the rip as **BIN/CUE**, convert it to **CHD**, or create a CHD and remove the BIN/CUE afterwards.
 
+**FAST CHD** creates the same CHD (subchannel included) with zlib compression only, skipping LZMA and FLAC. On MiSTer it is about 4 times quicker to create and quicker to decompress while playing; the file is about 15% larger for data tracks, more for discs with CD audio tracks. The BIN/CUE is removed after the CHD passes verification, like the normal CHD option.
+
 Disc Tools reads the disc in raw DAO mode so mixed-mode game discs and discs containing CDDA audio are preserved correctly.
 
 The raw subchannel (P-W) is read as well. It holds the position data (Q) of every sector, including the deliberately damaged Q sectors that some copy protections rely on, such as PSX LibCrypt. After the rip Disc Tools:

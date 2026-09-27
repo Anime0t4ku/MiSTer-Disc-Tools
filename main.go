@@ -721,6 +721,10 @@ func (a *App) menuWithBack(title string, items []string, initial int, allowBack 
 		}
 	}
 }
+
+// chdFastCodecs are the chdman createcd options of FAST CHD: zlib only.
+var chdFastCodecs = []string{"-c", "cdzl"}
+
 func (a *App) chdWarning() bool {
 	sel := 1 // Default to Cancel so CHD work is never started accidentally.
 	items := []string{"CONTINUE", "CANCEL"}
@@ -1680,10 +1684,17 @@ func (a *App) ripDisc() {
 	if !ok {
 		return
 	}
-	i, ok := a.menu("RIP DISC - OUTPUT", []string{"BIN/CUE", "CHD (KEEP BIN/CUE)", "CHD (DELETE BIN/CUE AFTER VERIFY)"}, 0)
+	i, ok := a.menu("RIP DISC - OUTPUT", []string{"BIN/CUE", "CHD (KEEP BIN/CUE)", "CHD (DELETE BIN/CUE AFTER VERIFY)", "FAST CHD (DELETE BIN/CUE AFTER VERIFY)"}, 0)
 	if !ok {
 		return
 	}
+	// FAST CHD: same image, same verification, but every hunk is stored with
+	// zlib (cdzl) only. chdman normally compresses each hunk with LZMA, zlib
+	// and FLAC and keeps the smallest result; LZMA and FLAC are the slow ones.
+	// About 4x quicker to create, about 15% larger for data tracks (more for
+	// CD-DA audio), and quicker to decompress. Subchannel data is identical.
+	fastCHD := i == 3
+	deleteAfterVerify := i == 2 || i == 3
 	if i != 0 && !a.chdWarning() {
 		return
 	}
@@ -1757,7 +1768,11 @@ func (a *App) ripDisc() {
 		// Build CHD from cdrdao's native TOC/BIN before replacing the BIN with
 		// the CUE-compatible byte-swapped copy. This preserves CD-DA byte order
 		// and the raw disc layout for CHD at the same time.
-		chdCmd := exec.Command(helper("chdman"), "createcd", "-i", filepath.Base(toc), "-o", chd)
+		chdArgs := []string{"createcd", "-i", filepath.Base(toc), "-o", chd}
+		if fastCHD {
+			chdArgs = append(chdArgs, chdFastCodecs...)
+		}
+		chdCmd := exec.Command(helper("chdman"), chdArgs...)
 		chdCmd.Dir = dest
 		if err := a.runJob("CONVERTING TO CHD", chdCmd); err != nil {
 			a.message("CHD CONVERSION FAILED", []string{err.Error(), "BIN/CUE/TOC were kept."})
@@ -1769,7 +1784,7 @@ func (a *App) ripDisc() {
 		}
 	}
 
-	if i == 2 {
+	if deleteAfterVerify {
 		_ = os.Remove(toc)
 		_ = os.Remove(cue)
 		_ = os.Remove(bin)
