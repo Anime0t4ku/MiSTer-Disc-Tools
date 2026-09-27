@@ -335,45 +335,78 @@ func lbaMSF(lba int) string {
 // processRawSubchannel realigns the raw subchannel of a cdrdao BIN in place,
 // writes subPath (CloneCD .sub) when not empty and returns a report.
 // onBytes receives progress over 2x the BIN size (read pass + write pass).
-func processRawSubchannel(bin, subPath string, cancel <-chan struct{}, onBytes func(int64)) (subchannelReport, error) {
+// loadRawSubchannel reads the raw subchannel of a cdrdao BIN into memory and
+// realigns it for the constant drive offset (the BIN is not modified yet).
+// onBytes receives progress over the BIN size.
+func loadRawSubchannel(bin string, cancel <-chan struct{}, onBytes func(int64)) ([]byte, subchannelReport, error) {
 	var rep subchannelReport
 	info, err := os.Stat(bin)
 	if err != nil {
-		return rep, err
+		return nil, rep, err
 	}
 	if info.Size()%rawSubStride != 0 {
-		return rep, fmt.Errorf("BIN size is not a multiple of %d bytes (raw sector + subchannel)", rawSubStride)
+		return nil, rep, fmt.Errorf("BIN size is not a multiple of %d bytes (raw sector + subchannel)", rawSubStride)
 	}
 	frames := int(info.Size() / rawSubStride)
 	rep.Frames = frames
 
 	subs, err := readSubchannel(bin, frames, cancel, onBytes)
 	if err != nil {
-		return rep, err
+		return nil, rep, err
 	}
 	measureSubOffset(subs, frames, &rep)
 	if rep.Offset != 0 {
 		subs = realignSubchannel(subs, frames, rep.Offset)
-		if err := writeSubchannelBack(bin, subs, frames, cancel, onBytes); err != nil {
-			return rep, err
-		}
 		rep.Corrected = true
-	} else {
-		onBytes(info.Size())
 	}
+	return subs, rep, nil
+}
 
+// saveRawSubchannel writes subs back into the BIN, writes subPath (CloneCD
+// .sub) when not empty and fills the list of sectors with a broken Q.
+// onBytes receives progress over the BIN size.
+func saveRawSubchannel(bin, subPath string, subs []byte, rep *subchannelReport, onBytes func(int64)) error {
+	frames := rep.Frames
+	if err := writeSubchannelBack(bin, subs, frames, nil, onBytes); err != nil {
+		return err
+	}
+	rep.BadCRCLBAs = rep.BadCRCLBAs[:0]
 	for i := 0; i < frames; i++ {
 		if !qCRCOK(qFromRaw(subs[i*subLen : (i+1)*subLen])) {
 			rep.BadCRCLBAs = append(rep.BadCRCLBAs, i)
 		}
 	}
-
 	if subPath != "" {
-		if err := writeCookedSub(subPath, subs, frames); err != nil {
-			return rep, err
+		return writeCookedSub(subPath, subs, frames)
+	}
+	return nil
+}
+
+// processRawSubchannel realigns the raw subchannel of a cdrdao BIN in place,
+// writes subPath (CloneCD .sub) when not empty and returns a report.
+// onBytes receives progress over 2x the BIN size (read pass + write pass).
+func processRawSubchannel(bin, subPath string, cancel <-chan struct{}, onBytes func(int64)) (subchannelReport, error) {
+	subs, rep, err := loadRawSubchannel(bin, cancel, onBytes)
+	if err != nil {
+		return rep, err
+	}
+	err = saveRawSubchannel(bin, subPath, subs, &rep, onBytes)
+	return rep, err
+}
+
+// subIsAudio reports whether a sector belongs to an audio track, from the
+// control bits of the nearest valid Q at or before it.
+func subIsAudio(subs []byte, frames, lba int) bool {
+	for i := lba; i >= 0 && i > lba-200; i-- {
+		if i >= frames {
+			continue
+		}
+		q := qFromRaw(subs[i*subLen : (i+1)*subLen])
+		if qCRCOK(q) {
+			return q[0]&0x40 == 0
 		}
 	}
-	return rep, nil
+	return false
 }
 
 func (r subchannelReport) text() string {

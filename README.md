@@ -29,6 +29,7 @@ Disc Tools reads the disc in raw DAO mode so mixed-mode game discs and discs con
 The raw subchannel (P-W) is read as well. It holds the position data (Q) of every sector, including the deliberately damaged Q sectors that some copy protections rely on, such as PSX LibCrypt. After the rip Disc Tools:
 
 - measures and corrects the constant subchannel offset that many drives have (the subchannel of a neighbouring sector is returned);
+- reads every suspicious sector again from the disc, several times: raw subchannel is not error corrected by the drive, and some drives return a whole block of sectors with the subchannel of the neighbouring sector. A sector keeps a broken Q only when the reads agree on it (copy protection or a real disc defect);
 - keeps the subchannel inside the CHD;
 - writes a CloneCD style `.sub` file next to the CUE/BIN (the CUE format cannot hold subchannel data);
 - writes a `.subq.log` report with the sectors whose Q CRC is broken (on a LibCrypt disc these are the protection sectors).

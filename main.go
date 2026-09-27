@@ -1722,27 +1722,11 @@ func (a *App) ripDisc() {
 		subStatus = "Subchannel: not supported by this drive"
 	}
 	if tocHasRawSubchannel(toc) {
-		var rep subchannelReport
-		err := a.runWorkWithProgress("PROCESSING SUBCHANNEL", filepath.Base(bin), func(total *int64) {
-			if info, e := os.Stat(bin); e == nil {
-				*total = 2 * info.Size()
-			}
-		}, func(cancel <-chan struct{}, onBytes func(int64)) error {
-			r, e := processRawSubchannel(bin, sub, cancel, onBytes)
-			rep = r
-			return e
-		})
-		if err != nil {
-			_ = os.Remove(sub)
-			a.message("RIP FAILED", []string{"Subchannel processing failed:", err.Error(), "BIN and TOC were kept."})
+		status, ok := a.finishRawSubchannel(bin, sub, base)
+		if !ok {
 			return
 		}
-		_ = os.WriteFile(base+".subq.log", []byte(rep.text()), 0644)
-		appendDiscToolsLog("subchannel " + filepath.Base(bin) + ":\n" + rep.text())
-		subStatus = fmt.Sprintf("Subchannel saved: %d sector(s) with a bad Q CRC", len(rep.BadCRCLBAs))
-		if rep.Corrected {
-			subStatus += fmt.Sprintf(", drive offset %+d corrected", rep.Offset)
-		}
+		subStatus = status
 	}
 	if err := normalizeDescriptorBinReference(toc, bin); err != nil {
 		a.message("RIP FAILED", []string{"Could not normalize TOC BIN path:", err.Error(), "BIN and TOC were kept."})
@@ -1817,6 +1801,82 @@ func (a *App) ripDisc() {
 	}
 }
 
+// finishRawSubchannel realigns, verifies against the disc and saves the raw
+// subchannel of a fresh rip. It shows its own error message and returns
+// false when the rip must be abandoned.
+func (a *App) finishRawSubchannel(bin, sub, base string) (string, bool) {
+	var subs []byte
+	var rep subchannelReport
+	binSize := func(total *int64) {
+		if info, e := os.Stat(bin); e == nil {
+			*total = info.Size()
+		}
+	}
+	err := a.runWorkWithProgress("PROCESSING SUBCHANNEL", filepath.Base(bin), binSize,
+		func(cancel <-chan struct{}, onBytes func(int64)) error {
+			var e error
+			subs, rep, e = loadRawSubchannel(bin, cancel, onBytes)
+			return e
+		})
+	if err != nil {
+		a.message("RIP FAILED", []string{"Subchannel processing failed:", err.Error(), "BIN and TOC were kept."})
+		return "", false
+	}
+
+	// Re-read every suspicious sector from the disc: a single raw pass is
+	// not an exact copy of the subchannel (see subverify.go).
+	var vres verifyResult
+	verified := false
+	suspects := len(subSuspects(subs, rep.Frames))
+	if suspects > 0 {
+		dev, e := openRawSubReader(device, func(lba int) bool { return subIsAudio(subs, rep.Frames, lba) })
+		if e != nil {
+			appendDiscToolsLog("subchannel verification skipped: " + e.Error())
+		} else {
+			err = a.runWorkWithProgressUnit("VERIFYING SUBCHANNEL", filepath.Base(bin), "sectors",
+				func(total *int64) { *total = int64(suspects) },
+				func(cancel <-chan struct{}, onBytes func(int64)) error {
+					var e error
+					vres, e = verifySubchannel(subs, rep.Frames, dev.read, cancel, func() { onBytes(1) })
+					return e
+				})
+			dev.Close()
+			if err != nil {
+				a.message("RIP FAILED", []string{"Subchannel verification failed:", err.Error(), "BIN and TOC were kept unchanged."})
+				return "", false
+			}
+			verified = true
+		}
+	}
+
+	err = a.runWorkWithProgress("SAVING SUBCHANNEL", filepath.Base(bin), binSize,
+		func(cancel <-chan struct{}, onBytes func(int64)) error {
+			return saveRawSubchannel(bin, sub, subs, &rep, onBytes)
+		})
+	if err != nil {
+		_ = os.Remove(sub)
+		a.message("RIP FAILED", []string{"Saving the subchannel failed:", err.Error(), "BIN and TOC were kept."})
+		return "", false
+	}
+
+	report := rep.text()
+	if verified {
+		report += vres.text()
+	} else if suspects > 0 {
+		report += "Verification: not done, the first-pass subchannel was kept\n"
+	}
+	_ = os.WriteFile(base+".subq.log", []byte(report), 0644)
+	appendDiscToolsLog("subchannel " + filepath.Base(bin) + ":\n" + report)
+
+	status := fmt.Sprintf("Subchannel saved: %d sector(s) with a broken Q", len(rep.BadCRCLBAs))
+	if verified {
+		status += fmt.Sprintf(" (verified, %d unresolved)", len(vres.Unresolved))
+	} else if suspects > 0 {
+		status += " (not verified)"
+	}
+	return status, true
+}
+
 func withStatus(lines []string, status string) []string {
 	if status == "" {
 		return lines
@@ -1837,6 +1897,12 @@ func appendDiscToolsLog(msg string) {
 // runWorkWithProgress runs an in-process task with the same progress screen
 // used for file copies. sizeFn sets the total amount of work in bytes.
 func (a *App) runWorkWithProgress(title, name string, sizeFn func(total *int64), work func(cancel <-chan struct{}, onBytes func(int64)) error) error {
+	return a.runWorkWithProgressUnit(title, name, "", sizeFn, work)
+}
+
+// runWorkWithProgressUnit is runWorkWithProgress with a unit name for the
+// amount line ("" = megabytes).
+func (a *App) runWorkWithProgressUnit(title, name, unit string, sizeFn func(total *int64), work func(cancel <-chan struct{}, onBytes func(int64)) error) error {
 	var total int64
 	sizeFn(&total)
 	updates := make(chan int64, 16)
@@ -1898,6 +1964,9 @@ func (a *App) runWorkWithProgress(title, name string, sizeFn func(total *int64),
 			a.fb.rect(barX+4, barY+4, inner, max(1, barH-8), fg)
 		}
 		amount := fmt.Sprintf("%.1f MB / %.1f MB", float64(current)/(1024*1024), float64(total)/(1024*1024))
+		if unit != "" {
+			amount = fmt.Sprintf("%d / %d %s", current, total, unit)
+		}
 		a.fb.text(centeredX(a.fb.w, statusScale, amount), barY+barH+35, statusScale, amount, fg)
 		shown := short(name, max(24, (a.fb.w-100)/6))
 		a.fb.text(centeredX(a.fb.w, 1, shown), barY+barH+69, 1, shown, dim)
