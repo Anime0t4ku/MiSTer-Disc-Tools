@@ -15,3 +15,5 @@ func (d *rawSubDevice) Close() {}
 func (d *rawSubDevice) read(lba, count int) ([]byte, error) {
 	return nil, errors.New("not supported")
 }
+
+func (d *rawSubDevice) setSpeed(x int) error { return errors.New("not supported") }

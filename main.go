@@ -1833,6 +1833,10 @@ func (a *App) finishRawSubchannel(bin, sub, base string) (string, bool) {
 		if e != nil {
 			appendDiscToolsLog("subchannel verification skipped: " + e.Error())
 		} else {
+			speedNote := fmt.Sprintf("Verification read speed: %dx\n", verifySpeed)
+			if e := dev.setSpeed(verifySpeed); e != nil {
+				speedNote = "Verification read speed: drive default (" + e.Error() + ")\n"
+			}
 			err = a.runWorkWithProgressUnit("VERIFYING SUBCHANNEL", filepath.Base(bin), "sectors",
 				func(total *int64) { *total = int64(suspects) },
 				func(cancel <-chan struct{}, onBytes func(int64)) error {
@@ -1840,7 +1844,9 @@ func (a *App) finishRawSubchannel(bin, sub, base string) (string, bool) {
 					vres, e = verifySubchannel(subs, rep.Frames, dev.read, cancel, func() { onBytes(1) })
 					return e
 				})
+			_ = dev.setSpeed(0) // back to the drive maximum
 			dev.Close()
+			rep.VerifyNote = speedNote
 			if err != nil {
 				a.message("RIP FAILED", []string{"Subchannel verification failed:", err.Error(), "BIN and TOC were kept unchanged."})
 				return "", false
@@ -1861,7 +1867,7 @@ func (a *App) finishRawSubchannel(bin, sub, base string) (string, bool) {
 
 	report := rep.text()
 	if verified {
-		report += vres.text()
+		report += rep.VerifyNote + vres.text()
 	} else if suspects > 0 {
 		report += "Verification: not done, the first-pass subchannel was kept\n"
 	}

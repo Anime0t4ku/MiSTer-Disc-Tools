@@ -25,6 +25,7 @@ const (
 	verifyPreRoll   = 6  // sectors read before the first suspect of a window
 	verifyPostRoll  = 4  // sectors read after the last suspect of a window
 	verifyMaxWindow = 26 // sectors per read command (64 KiB limit of many USB bridges)
+	verifySpeed     = 4  // read speed of the verification (x 176 kB/s); raw subchannel reads better slowly
 	verifyReads     = 3  // reads of every window
 	verifyMaxReads  = 12 // reads of a window whose broken Q values do not agree yet
 	// sectors that must go through the drive before a window is read again,

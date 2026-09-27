@@ -9,6 +9,12 @@ package main
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <scsi/sg.h>
+#include <linux/cdrom.h>
+
+static int dt_select_speed(int fd, int speed)
+{
+	return ioctl(fd, CDROM_SELECT_SPEED, speed);
+}
 
 // READ CD (0xBE) of count sectors from lba with raw P-W subchannel.
 // Returns 0 on success; buf receives count * (2352 + 96) bytes.
@@ -74,6 +80,14 @@ func openRawSubReader(dev string, audio func(lba int) bool) (*rawSubDevice, erro
 }
 
 func (d *rawSubDevice) Close() { d.f.Close() }
+
+// setSpeed selects the read speed (1 = 176 kB/s; 0 = drive maximum).
+func (d *rawSubDevice) setSpeed(x int) error {
+	if C.dt_select_speed(C.int(d.f.Fd()), C.int(x)) != 0 {
+		return fmt.Errorf("speed selection not supported")
+	}
+	return nil
+}
 
 func (d *rawSubDevice) read(lba, count int) ([]byte, error) {
 	if count <= 0 || count > verifyMaxWindow {

@@ -39,6 +39,7 @@ type subchannelReport struct {
 	Corrected   bool
 	BadCRCLBAs  []int
 	OffsetVotes map[int]int
+	VerifyNote  string
 }
 
 // qFromRaw extracts the 12 Q bytes from 96 bytes of raw interleaved P-W.
