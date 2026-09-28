@@ -26,6 +26,8 @@ You can keep the rip as **BIN/CUE**, convert it to **CHD**, or create a CHD and 
 
 **FAST CHD** creates the same CHD (subchannel included) with zlib compression only, skipping LZMA and FLAC. On MiSTer it is about 4 times quicker to create and quicker to decompress while playing; the file is about 15% larger for data tracks, more for discs with CD audio tracks. The BIN/CUE is removed after the CHD passes verification, like the normal CHD option.
 
+**ULTRA FAST CHD - UNCOMPRESSED** stores the image in a CHD without any compression: one file with the data and the subchannel instead of BIN + CUE + `.sub`, about the size of the BIN, created in about the time of a file copy. `chdman verify` cannot check an uncompressed CHD, so Disc Tools compares every frame of the CHD (data and subchannel) with the rip before it removes the BIN.
+
 Disc Tools reads the disc in raw DAO mode so mixed-mode game discs and discs containing CDDA audio are preserved correctly.
 
 The raw subchannel (P-W) is read as well. It holds the position data (Q) of every sector, including the deliberately damaged Q sectors that some copy protections rely on, such as PSX LibCrypt. After the rip Disc Tools:

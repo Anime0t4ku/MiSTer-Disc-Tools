@@ -1684,7 +1684,7 @@ func (a *App) ripDisc() {
 	if !ok {
 		return
 	}
-	i, ok := a.menu("RIP DISC - OUTPUT", []string{"BIN/CUE", "CHD (KEEP BIN/CUE)", "CHD (DELETE BIN/CUE AFTER VERIFY)", "FAST CHD (DELETE BIN/CUE AFTER VERIFY)"}, 0)
+	i, ok := a.menu("RIP DISC - OUTPUT", []string{"BIN/CUE", "CHD (KEEP BIN/CUE)", "CHD (DELETE BIN/CUE AFTER VERIFY)", "FAST CHD (DELETE BIN/CUE AFTER VERIFY)", "ULTRA FAST CHD - UNCOMPRESSED (DELETE BIN/CUE AFTER VERIFY)"}, 0)
 	if !ok {
 		return
 	}
@@ -1694,8 +1694,13 @@ func (a *App) ripDisc() {
 	// About 4x quicker to create, about 15% larger for data tracks (more for
 	// CD-DA audio), and quicker to decompress. Subchannel data is identical.
 	fastCHD := i == 3
-	deleteAfterVerify := i == 2 || i == 3
-	if i != 0 && !a.chdWarning() {
+	// ULTRA FAST CHD: no compression at all. One file with data and subchannel
+	// (instead of BIN + CUE + .sub), about the size of the BIN, created in
+	// about the time of a file copy. chdman verify cannot check uncompressed
+	// CHDs, so every frame is compared with the rip instead.
+	uncompressedCHD := i == 4
+	deleteAfterVerify := i == 2 || i == 3 || i == 4
+	if i != 0 && !uncompressedCHD && !a.chdWarning() { // no compression: nothing slow to warn about
 		return
 	}
 	base := newRipBase(dest)
@@ -1755,10 +1760,27 @@ func (a *App) ripDisc() {
 		if fastCHD {
 			chdArgs = append(chdArgs, chdFastCodecs...)
 		}
+		if uncompressedCHD {
+			chdArgs = append(chdArgs, "-c", "none")
+		}
 		chdCmd := exec.Command(helper("chdman"), chdArgs...)
 		chdCmd.Dir = dest
 		if err := a.runJob("CONVERTING TO CHD", chdCmd); err != nil {
 			return "CHD CONVERSION FAILED", []string{err.Error()}, false
+		}
+		if uncompressedCHD {
+			binSize := func(total *int64) {
+				if info, e := os.Stat(bin); e == nil {
+					*total = info.Size()
+				}
+			}
+			if err := a.runWorkWithProgress("VERIFYING CHD", filepath.Base(chd), binSize,
+				func(cancel <-chan struct{}, onBytes func(int64)) error {
+					return verifyUncompressedCHD(chd, bin, cancel, onBytes)
+				}); err != nil {
+				return "CHD VERIFY FAILED", []string{err.Error()}, false
+			}
+			return "", nil, true
 		}
 		if err := a.runJob("VERIFYING CHD", exec.Command(helper("chdman"), "verify", "-i", chd)); err != nil {
 			return "CHD VERIFY FAILED", []string{err.Error()}, false
