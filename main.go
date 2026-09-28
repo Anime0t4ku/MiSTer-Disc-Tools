@@ -1744,30 +1744,13 @@ func (a *App) ripDisc() {
 		return
 	}
 
-	convertedBin := base + "-cue.bin"
-	cmd = exec.Command(helper("toc2cue"), "-C", filepath.Base(convertedBin), "-s", filepath.Base(toc), filepath.Base(cue))
-	cmd.Dir = dest
-	if err := a.runJob("CREATING CUE", cmd); err != nil {
-		a.message("CUE FAILED", []string{err.Error(), "Native BIN and TOC were kept."})
-		return
-	}
-	if _, err := os.Stat(convertedBin); err != nil {
-		a.message("CUE FAILED", []string{"toc2cue did not create the expected CUE-compatible BIN.", "Native BIN and TOC were kept."})
-		return
-	}
-	if err := normalizeDescriptorBinReference(cue, convertedBin); err != nil {
-		a.message("CUE FAILED", []string{"Could not normalize CUE BIN path:", err.Error(), "Native BIN/TOC and converted BIN were kept."})
-		return
-	}
-
-	if i != 0 {
+	// makeCHD builds the CHD from cdrdao's native TOC/BIN (CD-DA byte order and
+	// raw disc layout, subchannel included) and verifies it. It returns the
+	// error title and lines, or ok.
+	makeCHD := func() (string, []string, bool) {
 		if err := checkHelper("chdman"); err != nil {
-			a.message("DEPENDENCY", []string{err.Error(), "BIN/CUE/TOC were kept."})
-			return
+			return "DEPENDENCY", []string{err.Error()}, false
 		}
-		// Build CHD from cdrdao's native TOC/BIN before replacing the BIN with
-		// the CUE-compatible byte-swapped copy. This preserves CD-DA byte order
-		// and the raw disc layout for CHD at the same time.
 		chdArgs := []string{"createcd", "-i", filepath.Base(toc), "-o", chd}
 		if fastCHD {
 			chdArgs = append(chdArgs, chdFastCodecs...)
@@ -1775,23 +1758,59 @@ func (a *App) ripDisc() {
 		chdCmd := exec.Command(helper("chdman"), chdArgs...)
 		chdCmd.Dir = dest
 		if err := a.runJob("CONVERTING TO CHD", chdCmd); err != nil {
-			a.message("CHD CONVERSION FAILED", []string{err.Error(), "BIN/CUE/TOC were kept."})
-			return
+			return "CHD CONVERSION FAILED", []string{err.Error()}, false
 		}
 		if err := a.runJob("VERIFYING CHD", exec.Command(helper("chdman"), "verify", "-i", chd)); err != nil {
-			a.message("CHD VERIFY FAILED", []string{err.Error(), "BIN/CUE/TOC were kept."})
-			return
+			return "CHD VERIFY FAILED", []string{err.Error()}, false
 		}
+		return "", nil, true
 	}
 
+	// CHD with BIN/CUE removed afterwards: the CUE-compatible BIN would be
+	// deleted right away, so it is not created at all (saves a full copy of
+	// the image). Only if the CHD fails, the BIN/CUE is created as a fallback.
+	var chdFailTitle string
+	var chdFailLines []string
 	if deleteAfterVerify {
-		_ = os.Remove(toc)
-		_ = os.Remove(cue)
-		_ = os.Remove(bin)
-		_ = os.Remove(convertedBin)
-		_ = os.Remove(sub)
-		a.message("RIP COMPLETE", withStatus([]string{"Created and verified:", chd}, subStatus))
+		title, lines, ok := makeCHD()
+		if ok {
+			_ = os.Remove(toc)
+			_ = os.Remove(bin)
+			_ = os.Remove(sub)
+			a.message("RIP COMPLETE", withStatus([]string{"Created and verified:", chd}, subStatus))
+			return
+		}
+		_ = os.Remove(chd)
+		if len(lines) > 0 && lines[0] == "cancelled" {
+			a.message(title, []string{"cancelled", "Native BIN and TOC were kept."})
+			return
+		}
+		chdFailTitle, chdFailLines = title, lines
+	}
+
+	convertedBin := base + "-cue.bin"
+	cmd = exec.Command(helper("toc2cue"), "-C", filepath.Base(convertedBin), "-s", filepath.Base(toc), filepath.Base(cue))
+	cmd.Dir = dest
+	if err := a.runJob("CREATING CUE", cmd); err != nil {
+		a.message("CUE FAILED", append(chdFailLines, err.Error(), "Native BIN and TOC were kept."))
 		return
+	}
+	if _, err := os.Stat(convertedBin); err != nil {
+		a.message("CUE FAILED", append(chdFailLines, "toc2cue did not create the expected CUE-compatible BIN.", "Native BIN and TOC were kept."))
+		return
+	}
+	if err := normalizeDescriptorBinReference(cue, convertedBin); err != nil {
+		a.message("CUE FAILED", append(chdFailLines, "Could not normalize CUE BIN path:", err.Error(), "Native BIN/TOC and converted BIN were kept."))
+		return
+	}
+
+	if i == 1 {
+		// Build CHD from the native TOC/BIN before replacing the BIN with the
+		// CUE-compatible byte-swapped copy.
+		if title, lines, ok := makeCHD(); !ok {
+			a.message(title, append(lines, "BIN/CUE/TOC were kept."))
+			return
+		}
 	}
 
 	// Publish the standard CUE/BIN pair only after native TOC/CHD work is done.
@@ -1809,9 +1828,12 @@ func (a *App) ripDisc() {
 	if _, err := os.Stat(sub); err == nil {
 		kept = append(kept, sub)
 	}
-	if i == 0 {
+	switch {
+	case chdFailTitle != "":
+		a.message(chdFailTitle, withStatus(append(append(chdFailLines, "BIN/CUE created instead:"), kept...), subStatus))
+	case i == 0:
 		a.message("RIP COMPLETE", withStatus(append([]string{"Created:"}, kept...), subStatus))
-	} else {
+	default:
 		a.message("RIP COMPLETE", withStatus(append([]string{"Created and verified:", chd, "Kept:"}, kept...), subStatus))
 	}
 }
