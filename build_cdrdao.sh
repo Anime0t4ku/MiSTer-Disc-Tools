@@ -37,6 +37,13 @@ rm -rf "$SRC" "$PREFIX"
 tar -xjf "$CACHE" -C third_party
 : > "$LOG"
 
+# Local cdrdao fixes (see patches/*.patch for the reason of each one)
+for p in "$PWD"/patches/cdrdao-*.patch; do
+  [ -f "$p" ] || continue
+  printf '[....] Applying %s\n' "$(basename "$p")"
+  patch -d "$SRC" -p1 < "$p" >>"$LOG" 2>&1 || { echo "[FAIL] Could not apply $(basename "$p")" >&2; exit 1; }
+done
+
 fail() {
   echo "[FAIL] cdrdao build failed" >&2
   tail -n 50 "$LOG" >&2 || true

@@ -1,0 +1,14 @@
+--- a/dao/GenericMMC.cc
++++ b/dao/GenericMMC.cc
+@@ -1793,6 +1793,11 @@
+   case TrackData::SUBCHAN_RW_RAW:
+     blockLen = AUDIO_BLOCK_LEN + 96;
+     cmd[10] = 0x01;
++    // Disc Tools: raw P-W also carries the Q channel. Analyze it like the
++    // default read mode does, so pre-gaps, index marks and ISRC codes are
++    // still detected while the raw sub-channel data is kept in the image.
++    if (!(options_ & OPT_MMC_USE_PQ))
++      subChanMode = CDR_READ_CAP_AUDIO_PW_RAW;
+     break;
+   }
+ 
