@@ -23,7 +23,7 @@ import (
 )
 
 const (
-	version        = "1.4.2"
+	version        = "1.5.0"
 	baseDir        = "/media/fat/Scripts/.config/disctools"
 	binDir         = baseDir + "/bin"
 	tempDir        = baseDir + "/temp"
