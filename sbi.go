@@ -29,10 +29,11 @@ var libcryptPairs = [16][2]int{
 }
 
 type libcryptResult struct {
-	Key03, Key09 uint16 // key read from each copy
-	Has09        bool   // every sector of the minute 09 copy could be read
-	Frames       []int  // modified sectors written to the .sbi (absolute frames), sorted
-	SBI          []byte // .sbi file contents, nil when the disc has no LibCrypt
+	Key03, Key09 uint16           // key read from each copy
+	Has09        bool             // every sector of the minute 09 copy could be read
+	Q            map[int][12]byte // full Q (with its broken CRC) of each sector in Frames
+	Frames       []int            // modified sectors written to the .sbi (absolute frames), sorted
+	SBI          []byte           // .sbi file contents, nil when the disc has no LibCrypt
 }
 
 func subQAt(subs []byte, frames, frame int) ([12]byte, bool) {
@@ -88,9 +89,11 @@ func libcryptFromQ(get qAtFrame) libcryptResult {
 		return r
 	}
 	sort.Ints(r.Frames)
+	r.Q = make(map[int][12]byte, len(r.Frames))
 	sbi := []byte{'S', 'B', 'I', 0}
 	for _, f := range r.Frames {
 		q, _ := get(f)
+		r.Q[f] = q
 		sbi = append(sbi, toBCD(f/75/60), toBCD(f/75%60), toBCD(f%75), 0x01)
 		sbi = append(sbi, q[:10]...)
 	}

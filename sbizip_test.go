@@ -168,12 +168,13 @@ func TestRealLibCrypt(t *testing.T) {
 		}
 	}
 	if cue, ref := os.Getenv("DT_CUE"), os.Getenv("DT_REAL_SBI"); cue != "" && ref != "" {
-		sbi, from := imageLibCrypt(cue, t.TempDir())
+		info := imageLibCrypt(cue, t.TempDir())
 		want, _ := os.ReadFile(ref)
-		t.Logf("%s: game ID %q, %s", filepath.Base(cue), cueGameID(cue), from)
-		if !bytes.Equal(sbi, want) || cueGameID(cue) != "SLES-02083" {
-			t.Fatalf("CUE + .sub: wrong .sbi or game ID")
+		t.Logf("%s: game ID %q, %s, %d full Q", filepath.Base(cue), cueGameID(cue), info.From, len(info.Q))
+		if !bytes.Equal(info.SBI, want) || cueGameID(cue) != "SLES-02083" || len(info.Q) != 32 {
+			t.Fatalf("CUE + .sub: wrong .sbi, Q or game ID")
 		}
+		checkRawTrack(t, cue, info.Q)
 	}
 	if chdman, chd := os.Getenv("DT_CHDMAN"), os.Getenv("DT_CHD"); chdman != "" && chd != "" {
 		if _, err := exec.LookPath(chdman); err != nil {
@@ -201,4 +202,50 @@ func TestRealLibCrypt(t *testing.T) {
 			}
 		}
 	}
+}
+
+// checkRawTrack builds the raw LibCrypt track of a single-BIN CUE and checks
+// it: same sector data, Q only on the protected sectors, equal to the .sub.
+func checkRawTrack(t *testing.T, cue string, q map[int][12]byte) {
+	t.Helper()
+	bin := cueSingleBinaryFile(cue)
+	st, _ := os.Stat(bin)
+	out := filepath.Join(t.TempDir(), "track01.raw")
+	if err := copyRangeWithSubQ(bin, out, 0, st.Size(), 0, q, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	src, _ := os.ReadFile(bin)
+	raw, _ := os.ReadFile(out)
+	n := len(src) / rawSectorLen
+	if len(raw) != n*rawSubStride {
+		t.Fatalf("raw size %d, want %d", len(raw), n*rawSubStride)
+	}
+	get, done, err := cookedSubQ(strings.TrimSuffix(cue, filepath.Ext(cue)) + ".sub")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer done()
+	withQ := 0
+	for lba := 0; lba < n; lba++ {
+		if !bytes.Equal(raw[lba*rawSubStride:lba*rawSubStride+rawSectorLen], src[lba*rawSectorLen:(lba+1)*rawSectorLen]) {
+			t.Fatalf("sector %d data differs", lba)
+		}
+		sub := raw[lba*rawSubStride+rawSectorLen : (lba+1)*rawSubStride]
+		if !bytes.Equal(sub, make([]byte, subLen)) {
+			withQ++
+			want, _ := get(lba + 150)
+			if _, ok := q[lba+150]; !ok || qFromRaw(sub) != want || qCRCOK(want) {
+				t.Fatalf("sector %d: unexpected subchannel", lba)
+			}
+			for _, b := range sub {
+				if b&^0x40 != 0 {
+					t.Fatalf("sector %d: bits outside the Q channel", lba)
+				}
+			}
+		}
+	}
+	if withQ != len(q) {
+		t.Fatalf("%d sectors with Q, want %d", withQ, len(q))
+	}
+	t.Logf("raw track: %d sectors, Q on %d (the LibCrypt ones), data identical", n, withQ)
 }

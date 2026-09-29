@@ -458,59 +458,71 @@ func lastLine(s string) string {
 	return lines[len(lines)-1]
 }
 
-// imageLibCrypt finds the .sbi of an image to burn: an .sbi next to it
-// (same name), else the subchannel (.sub next to a CUE, subcode of a CHD).
-// It returns the .sbi contents (nil when the image has no LibCrypt) and a
-// description of where the key came from.
-func imageLibCrypt(image, workDir string) ([]byte, string) {
+// imageLibCryptInfo is what Disc Tools knows about the LibCrypt protection
+// of an image to burn.
+type imageLibCryptInfo struct {
+	SBI     []byte           // .sbi for sbi.zip, nil when there is none
+	From    string           // where the key comes from, for the messages
+	Problem string           // why no .sbi could be made from the subchannel
+	Q       map[int][12]byte // full Q of the modified sectors (from the .sub or the CHD), nil without subchannel
+}
+
+// imageLibCrypt looks for the LibCrypt protection of an image to burn: the
+// subchannel (.sub next to a CUE, subcode of a CHD) and an .sbi next to the
+// image (same name). The .sbi, when present, wins for sbi.zip as in the
+// Main; only the subchannel has the complete Q needed for a raw copy.
+func imageLibCrypt(image, workDir string) imageLibCryptInfo {
+	var info imageLibCryptInfo
 	base := strings.TrimSuffix(image, filepath.Ext(image))
-	if b, err := os.ReadFile(base + ".sbi"); err == nil {
-		if key, ok := sbiKey(b); ok && key != 0 {
-			return b, fmt.Sprintf("key %04X from %s", key, filepath.Base(base+".sbi"))
-		}
-	}
+
 	var lc libcryptResult
-	var from string
+	found := false
+	from := ""
 	if strings.EqualFold(filepath.Ext(image), ".chd") {
 		r, ok, err := chdLibCrypt(image, workDir)
 		if err != nil {
 			appendDiscToolsLog("LibCrypt check of " + filepath.Base(image) + ": " + err.Error())
 		}
-		if !ok {
-			return nil, ""
-		}
-		lc, from = r, "the CHD subchannel"
-	} else {
-		get, done, err := cookedSubQ(base + ".sub")
-		if err != nil {
-			return nil, ""
-		}
-		lc, from = libcryptFromQ(get), filepath.Base(base+".sub")
+		lc, found, from = r, ok, "the CHD subchannel"
+	} else if get, done, err := cookedSubQ(base + ".sub"); err == nil {
+		lc, found, from = libcryptFromQ(get), true, filepath.Base(base+".sub")
 		done()
 	}
-	if lc.SBI == nil {
-		return nil, ""
+	if found && lc.SBI != nil {
+		if lc.consistent() {
+			info.SBI, info.Q = lc.SBI, lc.Q
+			info.From = fmt.Sprintf("key %04X from %s", lc.Key03, from)
+		} else {
+			info.Problem = fmt.Sprintf("the two copies of the key in %s differ (%04X, %04X)", from, lc.Key03, lc.Key09)
+			appendDiscToolsLog("LibCrypt check of " + filepath.Base(image) + ": " + info.Problem + ", subchannel not used")
+		}
 	}
-	if !lc.consistent() {
-		appendDiscToolsLog(fmt.Sprintf("LibCrypt check of %s: the two copies of the key differ (%04X, %04X), .sbi not used", filepath.Base(image), lc.Key03, lc.Key09))
-		return nil, fmt.Sprintf("the two copies of the key in %s differ (%04X, %04X)", from, lc.Key03, lc.Key09)
+
+	if b, err := os.ReadFile(base + ".sbi"); err == nil {
+		if key, ok := sbiKey(b); ok && key != 0 {
+			info.SBI = b
+			info.From = fmt.Sprintf("key %04X from %s", key, filepath.Base(base+".sbi"))
+			info.Problem = ""
+			if info.Q != nil && key != lc.Key03 {
+				appendDiscToolsLog(fmt.Sprintf("LibCrypt check of %s: %s has key %04X, the subchannel %04X", filepath.Base(image), filepath.Base(base+".sbi"), key, lc.Key03))
+			}
+		}
 	}
-	return lc.SBI, fmt.Sprintf("key %04X from %s", lc.Key03, from)
+	return info
 }
 
-// libcryptForBurn adds the .sbi of a LibCrypt image to sbi.zip before it is
-// burned. cue is the CUE that will be burned (for a CHD, the extracted one).
-// It returns lines for the BURN COMPLETE message (none for other discs).
-func libcryptForBurn(image, cue, workDir string) []string {
-	sbi, from := imageLibCrypt(image, workDir)
-	if sbi == nil {
-		if from != "" {
-			return []string{"PSX LibCrypt: " + from + ",", ".sbi not added to sbi.zip."}
+// libcryptForBurn adds the .sbi of a LibCrypt image to sbi.zip. cue is the
+// CUE that is burned (for a CHD, the extracted one), for the game ID. It
+// returns lines for the BURN COMPLETE message (none for other discs).
+func libcryptForBurn(image, cue string, info imageLibCryptInfo) []string {
+	if info.SBI == nil {
+		if info.Problem != "" {
+			return []string{"PSX LibCrypt: " + info.Problem + ",", ".sbi not added to sbi.zip."}
 		}
 		return nil
 	}
 	id := cueGameID(cue)
-	msg := addLibCryptToSBIZip(id, sbi)
-	appendDiscToolsLog("burn " + filepath.Base(image) + ": LibCrypt " + from + ", game ID " + id)
-	return []string{"PSX LibCrypt " + from + ":", msg}
+	msg := addLibCryptToSBIZip(id, info.SBI)
+	appendDiscToolsLog("burn " + filepath.Base(image) + ": LibCrypt " + info.From + ", game ID " + id)
+	return []string{"PSX LibCrypt " + info.From + ":", msg}
 }
