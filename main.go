@@ -1799,7 +1799,11 @@ func (a *App) ripDisc() {
 			_ = os.Remove(toc)
 			_ = os.Remove(bin)
 			_ = os.Remove(sub)
-			a.message("RIP COMPLETE", withStatus([]string{"Created and verified:", chd}, subStatus))
+			created := []string{"Created and verified:", chd}
+			if _, err := os.Stat(base + ".sbi"); err == nil {
+				created = append(created, base+".sbi")
+			}
+			a.message("RIP COMPLETE", withStatus(created, subStatus))
 			return
 		}
 		_ = os.Remove(chd)
@@ -1849,6 +1853,9 @@ func (a *App) ripDisc() {
 	kept := []string{cue, bin}
 	if _, err := os.Stat(sub); err == nil {
 		kept = append(kept, sub)
+	}
+	if _, err := os.Stat(base + ".sbi"); err == nil {
+		kept = append(kept, base+".sbi")
 	}
 	switch {
 	case chdFailTitle != "":
@@ -1930,6 +1937,14 @@ func (a *App) finishRawSubchannel(bin, sub, base string) (string, bool) {
 	} else if suspects > 0 {
 		report += "Verification: not done, the first-pass subchannel was kept\n"
 	}
+
+	// LibCrypt (PSX): .sbi with the modified sectors, for burned copies (sbi.zip)
+	// and for emulators that read .sbi files
+	lc, lcErr := writeLibCryptSBI(base+".sbi", subs, rep.Frames)
+	report += lc.text()
+	if lcErr != nil {
+		report += "  could not write the .sbi: " + lcErr.Error() + "\n"
+	}
 	_ = os.WriteFile(base+".subq.log", []byte(report), 0644)
 	appendDiscToolsLog("subchannel " + filepath.Base(bin) + ":\n" + report)
 
@@ -1938,6 +1953,9 @@ func (a *App) finishRawSubchannel(bin, sub, base string) (string, bool) {
 		status += fmt.Sprintf(" (verified, %d unresolved)", len(vres.Unresolved))
 	} else if suspects > 0 {
 		status += " (not verified)"
+	}
+	if lc.SBI != nil && lcErr == nil {
+		status += fmt.Sprintf(". LibCrypt key %04X, .sbi written", lc.Key03)
 	}
 	return status, true
 }

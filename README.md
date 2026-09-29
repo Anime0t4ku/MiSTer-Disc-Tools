@@ -37,6 +37,7 @@ The raw subchannel (P-W) is read as well. It holds the position data (Q) of ever
 - keeps the subchannel inside the CHD;
 - writes a CloneCD style `.sub` file next to the CUE/BIN (the CUE format cannot hold subchannel data);
 - writes a `.subq.log` report with the sectors whose Q CRC is broken (on a LibCrypt disc these are the protection sectors).
+- on a PSX LibCrypt disc, writes a `.sbi` file next to the image with the modified LibCrypt sectors (only the 64 known LibCrypt sectors are checked, and a pair is written only when both of its sectors are broken, so disc defects never end up in it). It is useful for burned copies (`sbi.zip`) and for emulators that read `.sbi` files.
 
 If the drive cannot return raw subchannel data, the disc is ripped without it, as before.
 
