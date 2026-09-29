@@ -30,6 +30,7 @@ var libcryptPairs = [16][2]int{
 
 type libcryptResult struct {
 	Key03, Key09 uint16 // key read from each copy
+	Has09        bool   // every sector of the minute 09 copy could be read
 	Frames       []int  // modified sectors written to the .sbi (absolute frames), sorted
 	SBI          []byte // .sbi file contents, nil when the disc has no LibCrypt
 }
@@ -42,20 +43,37 @@ func subQAt(subs []byte, frames, frame int) ([12]byte, bool) {
 	return qFromRaw(subs[lba*subLen : (lba+1)*subLen]), true
 }
 
-// brokenPair is true when both sectors of the pair starting at frame are on
-// the disc and have a broken Q.
-func brokenPair(subs []byte, frames, frame int) bool {
-	a, ok1 := subQAt(subs, frames, frame)
-	b, ok2 := subQAt(subs, frames, frame+5)
+// qAtFrame returns the Q of an absolute frame, false when it is not available.
+type qAtFrame func(frame int) ([12]byte, bool)
+
+// brokenPair is true when both sectors of the pair starting at frame are
+// available and have a broken Q.
+func brokenPair(get qAtFrame, frame int) bool {
+	a, ok1 := get(frame)
+	b, ok2 := get(frame + 5)
 	return ok1 && ok2 && !qCRCOK(a) && !qCRCOK(b)
 }
 
 func libcryptFromSubchannel(subs []byte, frames int) libcryptResult {
+	return libcryptFromQ(func(f int) ([12]byte, bool) { return subQAt(subs, frames, f) })
+}
+
+// libcryptFromQ builds the key and the .sbi from the Q of the 64 LibCrypt
+// sectors, whatever the source (rip, CloneCD .sub, CHD subcode).
+func libcryptFromQ(get qAtFrame) libcryptResult {
 	var r libcryptResult
+	r.Has09 = true
+	for _, p := range libcryptPairs {
+		for _, f := range []int{p[1], p[1] + 5} {
+			if _, ok := get(f); !ok {
+				r.Has09 = false
+			}
+		}
+	}
 	for bit, p := range libcryptPairs {
 		mask := uint16(1) << uint(15-bit)
 		for copyIdx, first := range p {
-			if !brokenPair(subs, frames, first) {
+			if !brokenPair(get, first) {
 				continue
 			}
 			if copyIdx == 0 {
@@ -72,12 +90,18 @@ func libcryptFromSubchannel(subs []byte, frames int) libcryptResult {
 	sort.Ints(r.Frames)
 	sbi := []byte{'S', 'B', 'I', 0}
 	for _, f := range r.Frames {
-		q, _ := subQAt(subs, frames, f)
+		q, _ := get(f)
 		sbi = append(sbi, toBCD(f/75/60), toBCD(f/75%60), toBCD(f%75), 0x01)
 		sbi = append(sbi, q[:10]...)
 	}
 	r.SBI = sbi
 	return r
+}
+
+// consistent is false when the two copies of the key disagree, which means
+// some LibCrypt sectors were read wrong (an unverified rip, a bad .sub).
+func (r libcryptResult) consistent() bool {
+	return !r.Has09 || r.Key03 == r.Key09
 }
 
 func (r libcryptResult) text() string {
@@ -86,7 +110,7 @@ func (r libcryptResult) text() string {
 	}
 	s := fmt.Sprintf("LibCrypt: key %04X (minute 03), %04X (minute 09 backup), %d sector(s) in the .sbi\n", r.Key03, r.Key09, len(r.Frames))
 	if r.Key03 != r.Key09 {
-		s += "  warning: the two copies of the key differ\n"
+		s += "  warning: the two copies of the key differ, .sbi not written\n"
 	}
 	return s
 }
@@ -95,7 +119,9 @@ func (r libcryptResult) text() string {
 // file otherwise. It returns the result for the report.
 func writeLibCryptSBI(path string, subs []byte, frames int) (libcryptResult, error) {
 	r := libcryptFromSubchannel(subs, frames)
-	if r.SBI == nil {
+	if r.SBI == nil || !r.consistent() {
+		// no LibCrypt, or some of its sectors were read wrong: a wrong .sbi
+		// next to the image would win over the real subchannel in the Main
 		_ = os.Remove(path)
 		return r, nil
 	}

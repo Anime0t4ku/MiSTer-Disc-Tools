@@ -814,7 +814,10 @@ func wrap(s string, n int) []string {
 	return out
 }
 
-func helper(name string) string { return filepath.Join(binDir, name) }
+// helperDir is a variable so the tests can use a chdman from elsewhere
+var helperDir = binDir
+
+func helper(name string) string { return filepath.Join(helperDir, name) }
 func checkHelper(name string) error {
 	p := helper(name)
 	st, e := os.Stat(p)
@@ -1945,6 +1948,15 @@ func (a *App) finishRawSubchannel(bin, sub, base string) (string, bool) {
 	if lcErr != nil {
 		report += "  could not write the .sbi: " + lcErr.Error() + "\n"
 	}
+	// and into the Main's sbi.zip, so a burned copy of this disc boots
+	zipNote := ""
+	if lc.SBI != nil && !lc.consistent() {
+		zipNote = "LibCrypt key copies differ, .sbi not added to sbi.zip"
+		report += "  " + zipNote + "\n"
+	} else if lc.SBI != nil {
+		zipNote = addLibCryptToSBIZip(psxGameID(sectorReader(bin, 0, rawSubStride)), lc.SBI)
+		report += "  " + zipNote + "\n"
+	}
 	_ = os.WriteFile(base+".subq.log", []byte(report), 0644)
 	appendDiscToolsLog("subchannel " + filepath.Base(bin) + ":\n" + report)
 
@@ -1954,8 +1966,11 @@ func (a *App) finishRawSubchannel(bin, sub, base string) (string, bool) {
 	} else if suspects > 0 {
 		status += " (not verified)"
 	}
-	if lc.SBI != nil && lcErr == nil {
+	if lc.SBI != nil && lcErr == nil && lc.consistent() {
 		status += fmt.Sprintf(". LibCrypt key %04X, .sbi written", lc.Key03)
+	}
+	if zipNote != "" {
+		status += ". " + zipNote
 	}
 	return status, true
 }
@@ -2747,7 +2762,7 @@ func (a *App) cdrdaoAcceptsCue(cue string) bool {
 	return a.runJob("CHECKING CUE", cmd) == nil
 }
 
-func (a *App) burnCuePrepared(cue, speed string) {
+func (a *App) burnCuePrepared(cue, speed string, note ...string) {
 	needsAudioSwap := cueNeedsAudioSwap(cue)
 	nativeCue, cleanupNative, err := a.stageNativeCue(cue)
 	if err != nil {
@@ -2816,7 +2831,7 @@ func (a *App) burnCuePrepared(cue, speed string) {
 		a.message("BURN FAILED", []string{err.Error()})
 		return
 	}
-	a.message("BURN COMPLETE", []string{"The disc was written successfully."})
+	a.message("BURN COMPLETE", append([]string{"The disc was written successfully."}, note...))
 }
 
 func (a *App) burnCue() {
@@ -2835,7 +2850,9 @@ func (a *App) burnCue() {
 	if !a.prepareBurnMedia() {
 		return
 	}
-	a.burnCuePrepared(cue, speed)
+	// PSX LibCrypt: a CD-R cannot carry the modified subchannel, the Main
+	// needs the .sbi in sbi.zip for the burned copy
+	a.burnCuePrepared(cue, speed, libcryptForBurn(cue, cue, tempDir)...)
 }
 func (a *App) burnCHD() {
 	if err := checkHelper("chdman"); err != nil {
@@ -2869,10 +2886,10 @@ func (a *App) burnCHD() {
 		a.message("CHD EXTRACTION FAILED", []string{err.Error()})
 		return
 	}
-	a.burnCuePath(cue, speed)
+	a.burnCuePath(cue, speed, libcryptForBurn(chd, cue, job)...)
 }
-func (a *App) burnCuePath(cue, speed string) {
-	a.burnCuePrepared(cue, speed)
+func (a *App) burnCuePath(cue, speed string, note ...string) {
+	a.burnCuePrepared(cue, speed, note...)
 }
 
 func copyTree(src, dst string) error {
