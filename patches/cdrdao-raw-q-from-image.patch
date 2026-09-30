@@ -1,0 +1,43 @@
+diff --git a/dao/GenericMMC.h b/dao/GenericMMC.h
+index 7cd416a..2d5fe90 100644
+--- a/dao/GenericMMC.h
++++ b/dao/GenericMMC.h
+@@ -57,6 +57,11 @@ class CdTextEncoder;
+ // drive supports Yamaha's Force Speed feature
+ #define OPT_MMC_YAMAHA_FORCE_SPEED 0x0200
+ 
++// Disc Tools, generic-mmc-raw with RW_RAW sub-channel data: for the sectors
++// whose image sub-channel carries a Q channel (any Q bit set), write that Q
++// instead of the generated one (copy protection such as PSX LibCrypt)
++#define OPT_MMC_RAW_Q_FROM_IMAGE 0x0400
++
+ // Driver for Generic MMC units
+ 
+ class GenericMMC : public CdrDriver
+diff --git a/dao/GenericMMCraw.cc b/dao/GenericMMCraw.cc
+index 256705b..edaf593 100644
+--- a/dao/GenericMMCraw.cc
++++ b/dao/GenericMMCraw.cc
+@@ -690,6 +690,22 @@ int GenericMMCraw::writeData(TrackData::Mode mode,
+                     u8 *oBuf = encodeBuffer_ + i * blockLength_ + AUDIO_BLOCK_LEN;
+                     const char *iBuf = buf + i * iblen + AUDIO_BLOCK_LEN;
+ 
++                    if ((options_ & OPT_MMC_RAW_Q_FROM_IMAGE) &&
++                        sm == TrackData::SUBCHAN_RW_RAW) {
++                        int qGiven = 0;
++
++                        for (j = 0; j < PW_SUBCHANNEL_LEN; j++) {
++                            if (iBuf[j] & 0x40) {
++                                qGiven = 1;
++                                break;
++                            }
++                        }
++                        if (qGiven) {
++                            for (j = 0; j < PW_SUBCHANNEL_LEN; j++)
++                                oBuf[j] = (oBuf[j] & ~0x40) | (iBuf[j] & 0x40);
++                        }
++                    }
++
+                     for (j = 0; j < PW_SUBCHANNEL_LEN; j++) {
+                         *oBuf |= (*iBuf & 0x3f);
+                         oBuf++;

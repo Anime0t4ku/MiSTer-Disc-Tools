@@ -814,7 +814,10 @@ func wrap(s string, n int) []string {
 	return out
 }
 
-func helper(name string) string { return filepath.Join(binDir, name) }
+// helperDir is a variable so the tests can use a chdman from elsewhere
+var helperDir = binDir
+
+func helper(name string) string { return filepath.Join(helperDir, name) }
 func checkHelper(name string) error {
 	p := helper(name)
 	st, e := os.Stat(p)
@@ -1799,7 +1802,11 @@ func (a *App) ripDisc() {
 			_ = os.Remove(toc)
 			_ = os.Remove(bin)
 			_ = os.Remove(sub)
-			a.message("RIP COMPLETE", withStatus([]string{"Created and verified:", chd}, subStatus))
+			created := []string{"Created and verified:", chd}
+			if _, err := os.Stat(base + ".sbi"); err == nil {
+				created = append(created, base+".sbi")
+			}
+			a.message("RIP COMPLETE", withStatus(created, subStatus))
 			return
 		}
 		_ = os.Remove(chd)
@@ -1849,6 +1856,9 @@ func (a *App) ripDisc() {
 	kept := []string{cue, bin}
 	if _, err := os.Stat(sub); err == nil {
 		kept = append(kept, sub)
+	}
+	if _, err := os.Stat(base + ".sbi"); err == nil {
+		kept = append(kept, base+".sbi")
 	}
 	switch {
 	case chdFailTitle != "":
@@ -1930,6 +1940,23 @@ func (a *App) finishRawSubchannel(bin, sub, base string) (string, bool) {
 	} else if suspects > 0 {
 		report += "Verification: not done, the first-pass subchannel was kept\n"
 	}
+
+	// LibCrypt (PSX): .sbi with the modified sectors, for burned copies (sbi.zip)
+	// and for emulators that read .sbi files
+	lc, lcErr := writeLibCryptSBI(base+".sbi", subs, rep.Frames)
+	report += lc.text()
+	if lcErr != nil {
+		report += "  could not write the .sbi: " + lcErr.Error() + "\n"
+	}
+	// and into the Main's sbi.zip, so a burned copy of this disc boots
+	zipNote := ""
+	if lc.SBI != nil && !lc.consistent() {
+		zipNote = "LibCrypt key copies differ, .sbi not added to sbi.zip"
+		report += "  " + zipNote + "\n"
+	} else if lc.SBI != nil {
+		zipNote = addLibCryptToSBIZip(psxGameID(sectorReader(bin, 0, rawSubStride)), lc.SBI)
+		report += "  " + zipNote + "\n"
+	}
 	_ = os.WriteFile(base+".subq.log", []byte(report), 0644)
 	appendDiscToolsLog("subchannel " + filepath.Base(bin) + ":\n" + report)
 
@@ -1938,6 +1965,12 @@ func (a *App) finishRawSubchannel(bin, sub, base string) (string, bool) {
 		status += fmt.Sprintf(" (verified, %d unresolved)", len(vres.Unresolved))
 	} else if suspects > 0 {
 		status += " (not verified)"
+	}
+	if lc.SBI != nil && lcErr == nil && lc.consistent() {
+		status += fmt.Sprintf(". LibCrypt key %04X, .sbi written", lc.Key03)
+	}
+	if zipNote != "" {
+		status += ". " + zipNote
 	}
 	return status, true
 }
@@ -2287,6 +2320,10 @@ type cueStageRange struct {
 	offset int64
 	length int64
 	track  int
+	// raw LibCrypt copy: write every sector followed by 96 bytes of raw
+	// subchannel, with the Q of subQ (absolute frames) and nothing elsewhere
+	subQ     map[int][12]byte
+	firstLBA int
 }
 
 type cueStageProgress struct {
@@ -2376,7 +2413,13 @@ func (a *App) copyCueRangesWithProgress(src string, ranges []cueStageRange, titl
 			case updates <- cueStageProgress{copied: copied, track: r.track, file: filepath.Base(r.dst)}:
 			default:
 			}
-			err := copyFileRangeCancelable(src, r.dst, r.offset, r.length, cancel, func(n int64) {
+			copyRange := copyFileRangeCancelable
+			if r.subQ != nil {
+				copyRange = func(src, dst string, offset, length int64, cancel <-chan struct{}, onBytes func(int64)) error {
+					return copyRangeWithSubQ(src, dst, offset, length, r.firstLBA, r.subQ, cancel, onBytes)
+				}
+			}
+			err := copyRange(src, r.dst, r.offset, r.length, cancel, func(n int64) {
 				copied += n
 				mb := copied / (1024 * 1024)
 				if mb != lastSent || copied >= total {
@@ -2471,6 +2514,13 @@ func (a *App) copyCueRangesWithProgress(src string, ranges []cueStageRange, titl
 // CUE track boundaries and creates a native cdrdao TOC while preserving both
 // generated PREGAPs and file-backed INDEX 00 -> INDEX 01 pregap data.
 func (a *App) stageRobustCueTOC(cue string) (string, func(), error) {
+	return a.stageCueTOC(cue, nil)
+}
+
+// stageCueTOC is stageRobustCueTOC; with rawQ (raw LibCrypt copy) the first
+// track, which must be the data track, is written with a raw subchannel
+// (RW_RAW) that carries the Q of the protected sectors.
+func (a *App) stageCueTOC(cue string, rawQ map[int][12]byte) (string, func(), error) {
 	source, tracks, err := parseSingleBinCueLayout(cue)
 	if err != nil {
 		return "", func() {}, err
@@ -2527,13 +2577,25 @@ func (a *App) stageRobustCueTOC(cue string) (string, func(), error) {
 		}
 
 		trackFile := fmt.Sprintf("track%02d.bin", tr.number)
+		rawSub := rawQ != nil && i == 0
+		if rawSub {
+			if tr.mode == "AUDIO" || startBlock != 0 || (tr.hasPregap && tr.pregap > 0) {
+				cleanup()
+				return "", func() {}, fmt.Errorf("raw LibCrypt copy needs the data track first, at the start of the BIN")
+			}
+			trackFile = "track01.raw"
+		}
 		trackPath := filepath.Join(dir, trackFile)
-		ranges = append(ranges, cueStageRange{
+		r := cueStageRange{
 			dst:    trackPath,
 			offset: startBlock * 2352,
 			length: (endBlock - startBlock) * 2352,
 			track:  tr.number,
-		})
+		}
+		if rawSub {
+			r.subQ, r.firstLBA = rawQ, int(startBlock)
+		}
+		ranges = append(ranges, r)
 
 		tocMode := ""
 		switch tr.mode {
@@ -2544,7 +2606,11 @@ func (a *App) stageRobustCueTOC(cue string) (string, func(), error) {
 		case "MODE2/2352":
 			tocMode = "MODE2_RAW"
 		}
-		fmt.Fprintf(&toc, "TRACK %s\n", tocMode)
+		if rawSub {
+			fmt.Fprintf(&toc, "TRACK %s RW_RAW\n", tocMode)
+		} else {
+			fmt.Fprintf(&toc, "TRACK %s\n", tocMode)
+		}
 		if tr.hasPregap && tr.pregap > 0 {
 			fmt.Fprintf(&toc, "PREGAP %s\n", cueBlocksMSF(tr.pregap))
 		}
@@ -2729,8 +2795,20 @@ func (a *App) cdrdaoAcceptsCue(cue string) bool {
 	return a.runJob("CHECKING CUE", cmd) == nil
 }
 
-func (a *App) burnCuePrepared(cue, speed string) {
+// burnExtras: lines for the BURN COMPLETE message, and for a raw LibCrypt
+// copy the Q of the protected sectors.
+type burnExtras struct {
+	note []string
+	rawQ map[int][12]byte
+}
+
+func (a *App) burnCuePrepared(cue, speed string, ex burnExtras) {
+	note := ex.note
 	needsAudioSwap := cueNeedsAudioSwap(cue)
+	if ex.rawQ != nil {
+		a.burnCueRawLibCrypt(cue, speed, needsAudioSwap, ex)
+		return
+	}
 	nativeCue, cleanupNative, err := a.stageNativeCue(cue)
 	if err != nil {
 		a.message("BURN FAILED", []string{"Could not prepare CUE/BIN image:", err.Error()})
@@ -2798,7 +2876,7 @@ func (a *App) burnCuePrepared(cue, speed string) {
 		a.message("BURN FAILED", []string{err.Error()})
 		return
 	}
-	a.message("BURN COMPLETE", []string{"The disc was written successfully."})
+	a.message("BURN COMPLETE", append([]string{"The disc was written successfully."}, note...))
 }
 
 func (a *App) burnCue() {
@@ -2810,6 +2888,11 @@ func (a *App) burnCue() {
 	if !ok {
 		return
 	}
+	lc := imageLibCrypt(cue, tempDir)
+	raw, ok := a.chooseLibCryptBurn(lc)
+	if !ok {
+		return
+	}
 	speed, ok := a.chooseBurnSpeed()
 	if !ok {
 		return
@@ -2817,7 +2900,13 @@ func (a *App) burnCue() {
 	if !a.prepareBurnMedia() {
 		return
 	}
-	a.burnCuePrepared(cue, speed)
+	// PSX LibCrypt: the Main needs the .sbi in sbi.zip for a burned copy;
+	// a raw copy also writes the protected Q on the disc
+	ex := burnExtras{note: libcryptForBurn(cue, cue, lc)}
+	if raw {
+		ex.rawQ = lc.Q
+	}
+	a.burnCuePrepared(cue, speed, ex)
 }
 func (a *App) burnCHD() {
 	if err := checkHelper("chdman"); err != nil {
@@ -2832,6 +2921,14 @@ func (a *App) burnCHD() {
 		return
 	}
 	chd, ok := a.browse(root, map[string]bool{".chd": true}, false)
+	if !ok {
+		return
+	}
+	lcDir := filepath.Join(tempDir, "chd-libcrypt-"+strconv.FormatInt(time.Now().UnixNano(), 10))
+	_ = os.MkdirAll(lcDir, 0755)
+	lc := imageLibCrypt(chd, lcDir)
+	_ = os.RemoveAll(lcDir)
+	raw, ok := a.chooseLibCryptBurn(lc)
 	if !ok {
 		return
 	}
@@ -2851,10 +2948,14 @@ func (a *App) burnCHD() {
 		a.message("CHD EXTRACTION FAILED", []string{err.Error()})
 		return
 	}
-	a.burnCuePath(cue, speed)
+	ex := burnExtras{note: libcryptForBurn(chd, cue, lc)}
+	if raw {
+		ex.rawQ = lc.Q
+	}
+	a.burnCuePath(cue, speed, ex)
 }
-func (a *App) burnCuePath(cue, speed string) {
-	a.burnCuePrepared(cue, speed)
+func (a *App) burnCuePath(cue, speed string, ex burnExtras) {
+	a.burnCuePrepared(cue, speed, ex)
 }
 
 func copyTree(src, dst string) error {
